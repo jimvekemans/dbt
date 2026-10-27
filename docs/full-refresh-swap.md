@@ -59,7 +59,7 @@ renames and moves the hooks around the swap.
 ## Chunks
 
 `chunks: N` splits the model output into `N` hash buckets on `chunk_by`, which defaults to
-`unique_key` when that is a single column. Like `unique_key`, `chunk_by` goes into the SQL
+`unique_key` when that is a single column (a string, or a list of one). Like `unique_key`, `chunk_by` goes into the SQL
 as written: quote it yourself if it is mixed-case or a reserved word.
 
 - Rows with a NULL key load with chunk 0. Every row lands in exactly one chunk.

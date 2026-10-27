@@ -69,6 +69,7 @@ pub fn swap_plan(model: &DbtModel) -> FsResult<Option<SwapPlan>> {
             .clone()
             .or_else(|| match &config.unique_key {
                 Some(DbtUniqueKey::Single(key)) => Some(key.clone()),
+                Some(DbtUniqueKey::Multiple(keys)) if keys.len() == 1 => Some(keys[0].clone()),
                 _ => None,
             });
         Some(column.ok_or_else(|| {
@@ -116,6 +117,20 @@ mod tests {
     fn chunk_by_defaults_to_single_unique_key() {
         let mut config = swap(Some(8));
         config.unique_key = Some(DbtUniqueKey::Single("id".to_string()));
+        let m = model(config, DbtMaterialization::Incremental);
+        assert_eq!(
+            swap_plan(&m).unwrap(),
+            Some(SwapPlan {
+                chunks: 8,
+                chunk_by: Some("id".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn chunk_by_defaults_to_one_element_unique_key_list() {
+        let mut config = swap(Some(8));
+        config.unique_key = Some(DbtUniqueKey::Multiple(vec!["id".to_string()]));
         let m = model(config, DbtMaterialization::Incremental);
         assert_eq!(
             swap_plan(&m).unwrap(),
