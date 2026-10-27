@@ -1700,6 +1700,117 @@ impl Adapter {
         }
     }
 
+    /// SQL boolean selecting chunk `chunk` (0-based) of `chunks` hash chunks
+    /// on `column`. Default for the `get_chunk_predicate` macro, used by the
+    /// `full_refresh_strategy: swap` rebuild.
+    #[tracing::instrument(skip(self, _state), level = "trace")]
+    pub fn chunk_predicate(
+        &self,
+        _state: &State,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        let iter = ArgsIter::new("chunk_predicate", &["column", "chunks", "chunk"], args);
+        let column = iter.next_arg::<String>()?;
+        let chunks = iter.next_arg::<u64>()?;
+        let chunk = iter.next_arg::<u64>()?;
+        iter.finish()?;
+
+        let adapter_type = self.adapter_type();
+        dbt_adapter_sql::chunking::chunk_predicate(adapter_type, &column, chunks, chunk)
+            .map(Value::from)
+            .ok_or_else(|| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!(
+                        "{adapter_type} has no default chunk hash; override the \
+                         `get_chunk_predicate` macro to use `chunks`"
+                    ),
+                )
+            })
+    }
+
+    /// Replace `relation` with `shadow`. Default for the `swap_relations` macro.
+    ///
+    /// - No existing relation: rename `shadow` to `target`.
+    /// - Existing view: drop it, then rename.
+    /// - Existing table: Snowflake swaps in one statement; Postgres, Redshift
+    ///   and DuckDB rename both tables in one transaction; other adapters rename
+    ///   `target` to `backup` and `shadow` to `target` in two statements, so
+    ///   readers can briefly find no `target`. The old data is dropped last.
+    #[tracing::instrument(skip(self, state), level = "trace")]
+    pub fn swap_relations(&self, state: &State, args: &[Value]) -> Result<Value, minijinja::Error> {
+        let Typed { adapter, .. } = &self.inner else {
+            return Ok(none_value());
+        };
+        let iter = ArgsIter::new("swap_relations", &["relation", "shadow", "backup"], args);
+        let target_val = iter.next_arg::<&Value>()?;
+        let shadow_val = iter.next_arg::<&Value>()?;
+        let backup_val = iter.next_arg::<&Value>()?;
+        iter.finish()?;
+        let target = downcast_value_to_dyn_base_relation(target_val)?;
+        let shadow = downcast_value_to_dyn_base_relation(shadow_val)?;
+        let backup = downcast_value_to_dyn_base_relation(backup_val)?;
+
+        let existing = self.get_relation(
+            state,
+            target.database().unwrap_or_default(),
+            target.schema().unwrap_or_default(),
+            target.identifier().unwrap_or_default(),
+            false,
+        )?;
+        if existing.is_none() {
+            return self.rename_relation(state, &[shadow_val.clone(), target_val.clone()]);
+        }
+        let existing_rel = downcast_value_to_dyn_base_relation(&existing)?;
+        if !existing_rel.is_table() {
+            self.drop_relation(state, std::slice::from_ref(&existing))?;
+            return self.rename_relation(state, &[shadow_val.clone(), target_val.clone()]);
+        }
+
+        let adapter_type = self.adapter_type();
+        let run = |sql: &str| self.execute(state, None, sql, false, false, None, None);
+        let rename_to = |relation: &Arc<dyn BaseRelation>| {
+            dbt_adapter_sql::ident::quote_identifier(
+                relation.identifier().unwrap_or_default(),
+                adapter_type,
+            )
+        };
+        match adapter_type {
+            AdapterType::Snowflake => {
+                run(&format!(
+                    "alter table {} swap with {}",
+                    target.render_self_as_str(),
+                    shadow.render_self_as_str()
+                ))?;
+                // `shadow` now holds the old data.
+                self.drop_relation(state, std::slice::from_ref(shadow_val))?;
+            }
+            AdapterType::Postgres | AdapterType::Redshift | AdapterType::DuckDB => {
+                self.drop_relation(state, std::slice::from_ref(backup_val))?;
+                // One execute call: the statements share a connection, and a
+                // failure inside the open transaction retires that connection,
+                // which rolls the transaction back.
+                run(&format!(
+                    "begin;\nalter table {} rename to {};\nalter table {} rename to {};\ncommit;",
+                    target.render_self_as_str(),
+                    rename_to(&backup),
+                    shadow.render_self_as_str(),
+                    rename_to(&target)
+                ))?;
+                adapter.cache_renamed(state, &target, &backup)?;
+                adapter.cache_renamed(state, &shadow, &target)?;
+                self.drop_relation(state, std::slice::from_ref(backup_val))?;
+            }
+            _ => {
+                self.drop_relation(state, std::slice::from_ref(backup_val))?;
+                self.rename_relation(state, &[target_val.clone(), backup_val.clone()])?;
+                self.rename_relation(state, &[shadow_val.clone(), target_val.clone()])?;
+                self.drop_relation(state, std::slice::from_ref(backup_val))?;
+            }
+        }
+        Ok(none_value())
+    }
+
     /// Check if schema exists
     ///
     /// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L849
@@ -4087,6 +4198,8 @@ impl Adapter {
             // database: str
             "verify_database" => self.verify_database(state, args),
             "clean_up_limit_alias" => self.clean_up_limit_alias(state, args),
+            "chunk_predicate" => self.chunk_predicate(state, args),
+            "swap_relations" => self.swap_relations(state, args),
             "commit" => self.commit(),
             // context: dict, strategy: str
             "get_incremental_strategy_macro" => self.get_incremental_strategy_macro(state, args),

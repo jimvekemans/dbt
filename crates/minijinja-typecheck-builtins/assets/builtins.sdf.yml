@@ -28,6 +28,10 @@ object:
       type: adapter.get_columns_in_relation
     - name: rename_relation
       type: adapter.rename_relation
+    - name: chunk_predicate
+      type: adapter.chunk_predicate
+    - name: swap_relations
+      type: adapter.swap_relations
     - name: execute
       type: adapter.execute
     - name: get_incremental_strategy_macro
@@ -300,6 +304,36 @@ object:
         type: relation
         is-optional: false
       - name: new_relation
+        type: relation
+        is-optional: false
+    return-type: none
+---
+object:
+  id: adapter.chunk_predicate
+  call:
+    arguments:
+      - name: column
+        type: string
+        is-optional: false
+      - name: chunks
+        type: integer
+        is-optional: false
+      - name: chunk
+        type: integer
+        is-optional: false
+    return-type: string
+---
+object:
+  id: adapter.swap_relations
+  call:
+    arguments:
+      - name: relation
+        type: relation
+        is-optional: false
+      - name: shadow
+        type: relation
+        is-optional: false
+      - name: backup
         type: relation
         is-optional: false
     return-type: none

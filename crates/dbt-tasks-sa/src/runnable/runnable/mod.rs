@@ -43,8 +43,9 @@ use crate::materialize::{
 };
 use crate::runnable::cache::cache_materialization_return_value;
 use crate::runnable::model::{
-    create_microbatch_span, execute_microbatch_batch, execute_model_remote,
-    prepare_microbatch_batches, resolve_microbatch_window, try_get_microbatch_model,
+    begin_microbatch_swap, create_microbatch_span, execute_microbatch_batch, execute_model_remote,
+    finish_microbatch_swap, prepare_microbatch_batches, resolve_microbatch_window,
+    try_get_microbatch_model,
 };
 use crate::runnable::seed::{execute_seed_remote, maybe_resolve_remote_seed_column_hint};
 use crate::runnable::unit_test::execute_unit_test_remote;
@@ -393,27 +394,45 @@ impl Task for RunTask {
                         } else {
                             // Node is Microbatch
                             // Requires us to produce batches and ensure each batch respects connection limits
-                            let res = if try_get_microbatch_model(self.node.as_ref()).is_some() {
-                                let batch_groups = prepare_microbatch_batches(
-                                    self.node.clone(),
-                                    ctx,
-                                    &task_result,
-                                )
-                                .await?;
-                                // An empty event window yields no batches, so the target
-                                // relation is never materialized on a first run. Mirror
-                                // dbt-core's `if not relations` guard: only create the
-                                // pointer view when at least one batch executed.
-                                let had_batches = !batch_groups.is_empty();
-                                for group in batch_groups {
-                                    run_concurrent_task_operations(group.into_iter().map(|task| {
-                                        let ctx = ctx.clone();
-                                        (create_microbatch_span(&task), move |canceled| {
-                                            execute_microbatch_batch(task, &ctx, canceled)
-                                        })
-                                    }))
-                                    .await?;
+                            let res = if let Some(mb_model) =
+                                try_get_microbatch_model(self.node.as_ref())
+                            {
+                                // `full_refresh_strategy: swap` runs the batches against a
+                                // shadow relation and swaps it in after the last batch.
+                                let shadow_build = begin_microbatch_swap(mb_model, ctx).await?;
+                                let batch_node = shadow_build.as_ref().map_or_else(
+                                    || self.node.clone(),
+                                    |build| {
+                                        build.shadow_model.clone()
+                                            as Arc<dyn InternalDbtNodeAttributes>
+                                    },
+                                );
+                                let batches = async {
+                                    let batch_groups =
+                                        prepare_microbatch_batches(batch_node, ctx, &task_result)
+                                            .await?;
+                                    // An empty event window yields no batches, so the target
+                                    // relation is never materialized on a first run. Mirror
+                                    // dbt-core's `if not relations` guard: only create the
+                                    // pointer view when at least one batch executed.
+                                    let had_batches = !batch_groups.is_empty();
+                                    for group in batch_groups {
+                                        run_concurrent_task_operations(group.into_iter().map(
+                                            |task| {
+                                                let ctx = ctx.clone();
+                                                (create_microbatch_span(&task), move |canceled| {
+                                                    execute_microbatch_batch(task, &ctx, canceled)
+                                                })
+                                            },
+                                        ))
+                                        .await?;
+                                    }
+                                    Ok::<bool, Box<dbt_common::FsError>>(had_batches)
                                 }
+                                .await;
+                                let had_batches =
+                                    finish_microbatch_swap(mb_model, shadow_build, batches, ctx)
+                                        .await?;
 
                                 // After all microbatch batches succeed, create the latest
                                 // version pointer view if applicable. Skip when no batches

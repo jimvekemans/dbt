@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use crate::full_refresh_swap::{
+    ShadowBuild, SwapEnv, materialize_model_swap, rebuilds_from_scratch, swap_plan,
+};
 use crate::materialize::{
     materialize_latest_version_pointer, materialize_microbatch_model, materialize_model,
     should_create_latest_version_pointer,
@@ -29,7 +32,7 @@ use dbt_telemetry::{
 use minijinja::Value;
 use tracing::debug;
 
-use dbt_tasks_core::task::TaskResult;
+use dbt_tasks_core::task::{TaskResult, run_blocking_task_operation};
 
 /// Check if a model uses the microbatch incremental strategy.
 pub fn try_get_microbatch_model(node: &dyn InternalDbtNodeAttributes) -> Option<&DbtModel> {
@@ -52,6 +55,9 @@ pub struct MicrobatchExecUnit {
     pub run_node_context: Arc<std::collections::BTreeMap<String, Value>>,
     pub event_time_mapping: Arc<std::collections::BTreeMap<String, String>>,
     pub is_incremental: bool,
+    /// Relation shown in progress output: the model's own, also when the
+    /// batches build into a `full_refresh_strategy: swap` shadow.
+    pub display_relation: (String, String),
 }
 
 /// Cap on concurrent batches per model, independent of `--threads`. Keeps us
@@ -141,6 +147,11 @@ pub async fn prepare_microbatch_batches(
         .0,
     );
 
+    let display_relation = ctx.nodes().get_node(unique_id).map_or_else(
+        || (node.schema(), node.alias()),
+        |graph_node| (graph_node.schema(), graph_node.alias()),
+    );
+
     // Group batches: [[first], [mid1, mid2, ...], [last]]
     let concurrent = model.deprecated_config.concurrent_batches.unwrap_or(false);
     let groups: Vec<Vec<MicrobatchExecUnit>> = batches
@@ -155,6 +166,7 @@ pub async fn prepare_microbatch_batches(
                     run_node_context: run_node_context.clone(),
                     event_time_mapping: event_time_mapping.clone(),
                     is_incremental,
+                    display_relation: display_relation.clone(),
                 })
                 .collect()
         })
@@ -165,6 +177,82 @@ pub async fn prepare_microbatch_batches(
         None => groups,
     };
     Ok(groups)
+}
+
+/// Start a `full_refresh_strategy: swap` rebuild of a microbatch model, when
+/// this run rebuilds it from scratch. The batches then run against the
+/// returned build's `shadow_model`.
+pub async fn begin_microbatch_swap(
+    model: &DbtModel,
+    ctx: &TaskRunnerCtx,
+) -> FsResult<Option<Arc<ShadowBuild>>> {
+    if swap_plan(model)?.is_none() {
+        return Ok(None);
+    }
+    let full_refresh = model
+        .deprecated_config
+        .full_refresh
+        .unwrap_or(ctx.inner.arg.full_refresh);
+    let model = model.clone();
+    let ctx = ctx.clone();
+    run_blocking_task_operation(move || {
+        if !rebuilds_from_scratch(&model, full_refresh, &ctx.env) {
+            return Ok(None);
+        }
+        let base_context = ctx.run_base_context(&model)?;
+        ShadowBuild::begin(&model, None, &swap_env(&model, &ctx, &base_context))
+            .map(|build| Some(Arc::new(build)))
+    })
+    .await?
+}
+
+/// Complete or abandon a microbatch `swap` rebuild once its batches ran:
+/// swap the shadow in when at least one batch succeeded, drop it otherwise.
+/// Passes `batches` (whether any batch ran) through.
+pub async fn finish_microbatch_swap(
+    model: &DbtModel,
+    build: Option<Arc<ShadowBuild>>,
+    batches: FsResult<bool>,
+    ctx: &TaskRunnerCtx,
+) -> FsResult<bool> {
+    let Some(build) = build else {
+        return batches;
+    };
+    let model = model.clone();
+    let ctx = ctx.clone();
+    run_blocking_task_operation(move || match batches {
+        Ok(true) => {
+            let base_context = ctx.run_base_context(&model)?;
+            build
+                .finish(&model, None, &swap_env(&model, &ctx, &base_context))
+                .inspect_err(|_| build.abort(&ctx.env))?;
+            Ok(true)
+        }
+        Ok(false) => {
+            build.abort(&ctx.env);
+            Ok(false)
+        }
+        Err(e) => {
+            build.abort(&ctx.env);
+            Err(e)
+        }
+    })
+    .await?
+}
+
+fn swap_env<'a>(
+    model: &DbtModel,
+    ctx: &'a TaskRunnerCtx,
+    base_context: &'a std::collections::BTreeMap<String, Value>,
+) -> SwapEnv<'a> {
+    SwapEnv {
+        adapter_type: model.node_adapter(),
+        runtime_config: ctx.runtime_config(),
+        materialization_resolver: &ctx.inner.materialization_resolver,
+        jinja_env: ctx.env.clone(),
+        base_context,
+        io_args: &ctx.inner.arg.io,
+    }
 }
 
 /// Split any group larger than `max_size` into consecutive sub-groups of at
@@ -277,8 +365,8 @@ pub fn create_microbatch_span(mb_unit: &MicrobatchExecUnit) -> tracing::Span {
     let batch = &mb_unit.batch_ctx;
     create_info_span(MicrobatchEvaluated::start(
         mb_unit.node.unique_id(),
-        mb_unit.node.schema(),
-        mb_unit.node.alias(),
+        mb_unit.display_relation.0.clone(),
+        mb_unit.display_relation.1.clone(),
         batch.id.clone(),
         batch_size,
         batch.batch_index as u32 + 1,
@@ -409,20 +497,38 @@ pub fn execute_model_remote(
         .config_map
         .read_sync("sql_header", |_, v| v.clone());
 
+    // `full_refresh_strategy: swap` rebuilds into a shadow relation and swaps it in.
+    let full_refresh = model
+        .deprecated_config
+        .full_refresh
+        .unwrap_or(ctx.inner.arg.full_refresh);
+    let swap_plan =
+        swap_plan(model)?.filter(|_| rebuilds_from_scratch(model, full_refresh, &ctx.env));
+
     // Traditional warehouse execution via Jinja materialization macros
-    match materialize_model(
-        &task_result.sql_instruction.sql,
-        ctx.nodes()
-            .get_node_owned(&model.common().unique_id)
-            .expect("model must be present in the node graph"),
-        model.node_adapter(),
-        ctx.runtime_config(),
-        &ctx.inner.materialization_resolver,
-        ctx.env.clone(),
-        &base_context,
-        &ctx.inner.arg.io,
-        sql_header,
-    ) {
+    let materialized = match swap_plan {
+        Some(plan) => materialize_model_swap(
+            &task_result.sql_instruction.sql,
+            model,
+            &plan,
+            sql_header,
+            &swap_env(model, ctx, &base_context),
+        ),
+        None => materialize_model(
+            &task_result.sql_instruction.sql,
+            ctx.nodes()
+                .get_node_owned(&model.common().unique_id)
+                .expect("model must be present in the node graph"),
+            model.node_adapter(),
+            ctx.runtime_config(),
+            &ctx.inner.materialization_resolver,
+            ctx.env.clone(),
+            &base_context,
+            &ctx.inner.arg.io,
+            sql_header,
+        ),
+    };
+    match materialized {
         Ok((relations_map, main_response)) => {
             if let Some(main_response) = main_response {
                 ctx.inner

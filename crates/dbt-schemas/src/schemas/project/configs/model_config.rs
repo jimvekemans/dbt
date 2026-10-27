@@ -60,6 +60,21 @@ pub struct LatestVersionPointer {
 }
 
 // NOTE: No #[skip_serializing_none] - we handle None serialization in serialize_with_mode
+/// How a full rebuild of a `table` or `incremental` model replaces the
+/// existing relation.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, DbtSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FullRefreshStrategy {
+    /// The adapter's materialization replaces the relation itself (default).
+    #[default]
+    InPlace,
+    /// Build into a shadow relation (optionally in hash chunks), then swap it
+    /// in once every chunk has loaded.
+    Swap,
+}
+
+impl crate::schemas::project::configs::config_merge::ReplaceIfNone for FullRefreshStrategy {}
+
 #[derive(Deserialize, Serialize, Debug, Clone, DbtSchema)]
 pub struct ProjectModelConfig {
     #[serde(rename = "+access")]
@@ -140,6 +155,12 @@ pub struct ProjectModelConfig {
         deserialize_with = "bool_or_string_bool"
     )]
     pub concurrent_batches: Option<bool>,
+    #[serde(rename = "+full_refresh_strategy")]
+    pub full_refresh_strategy: Option<FullRefreshStrategy>,
+    #[serde(rename = "+chunks")]
+    pub chunks: Option<u64>,
+    #[serde(rename = "+chunk_by")]
+    pub chunk_by: Option<String>,
     #[serde(rename = "+contract")]
     pub contract: Option<DbtContract>,
     #[serde(rename = "+compression")]
@@ -734,6 +755,9 @@ impl TypedRecursiveConfig for ProjectModelConfig {
             || self.column_types.is_some()
             || self.compute.is_some()
             || self.concurrent_batches.is_some()
+            || self.full_refresh_strategy.is_some()
+            || self.chunks.is_some()
+            || self.chunk_by.is_some()
             || self.contract.is_some()
             || self.compression.is_some()
             || self.database.is_present()
@@ -983,6 +1007,13 @@ pub struct ModelConfig {
     pub event_time: Option<String>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub concurrent_batches: Option<bool>,
+    /// How a full rebuild replaces the existing relation. See
+    /// `docs/full-refresh-swap.md`.
+    pub full_refresh_strategy: Option<FullRefreshStrategy>,
+    /// Number of hash chunks a `swap` full refresh loads the model in.
+    pub chunks: Option<u64>,
+    /// Output column the chunks are hashed on. Defaults to `unique_key`.
+    pub chunk_by: Option<String>,
     pub merge_update_columns: Option<StringOrArrayOfStrings>,
     pub merge_exclude_columns: Option<StringOrArrayOfStrings>,
     pub access: Option<Access>,
@@ -1059,6 +1090,9 @@ impl From<ProjectModelConfig> for ModelConfig {
             column_types: config.column_types,
             compute: config.compute,
             concurrent_batches: config.concurrent_batches,
+            full_refresh_strategy: config.full_refresh_strategy,
+            chunks: config.chunks,
+            chunk_by: config.chunk_by,
             contract: config.contract,
             database: config.database,
             docs: config.docs,
@@ -1273,6 +1307,9 @@ impl From<ModelConfig> for ProjectModelConfig {
             column_types: config.column_types,
             compute: config.compute,
             concurrent_batches: config.concurrent_batches,
+            full_refresh_strategy: config.full_refresh_strategy,
+            chunks: config.chunks,
+            chunk_by: config.chunk_by,
             contract: config.contract,
             database: config.database,
             description: config.__warehouse_specific_config__.description,

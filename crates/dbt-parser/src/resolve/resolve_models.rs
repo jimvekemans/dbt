@@ -1201,6 +1201,11 @@ async fn build_model_nodes(
                 };
             }
         }
+        if matches!(status, ModelStatus::Enabled)
+            && let Err(e) = dbt_schemas::schemas::full_refresh_swap::swap_plan(&dbt_model)
+        {
+            emit_error_log_from_fs_error(e.with_location(dbt_asset.path.clone()));
+        }
         match node_resolver.insert_ref(&dbt_model, status, false) {
             Ok(_) => (),
             Err(e) => {
