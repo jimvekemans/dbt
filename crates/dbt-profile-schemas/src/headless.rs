@@ -10,7 +10,8 @@ use dbt_adapter_core::AdapterType;
 use dbt_common::{ErrorCode, FsResult, fs_err};
 use dbt_schemas::schemas::profiles::{
     BigqueryDbConfig, ClickHouseDbConfig, DatabricksDbConfig, DbConfig, DuckDbConfig,
-    ExasolDbConfig, FabricDbConfig, PostgresDbConfig, RedshiftDbConfig, SnowflakeDbConfig,
+    ExasolDbConfig, FabricDbConfig, PostgresDbConfig, RedshiftDbConfig, SingleStoreDbConfig,
+    SnowflakeDbConfig,
 };
 use dbt_schemas::schemas::serde::StringOrInteger;
 
@@ -33,6 +34,7 @@ pub fn supported_adapters() -> Vec<AdapterType> {
         AdapterType::Postgres,
         AdapterType::Redshift,
         AdapterType::Fabric,
+        AdapterType::SingleStore,
     ]
 }
 
@@ -48,6 +50,7 @@ pub fn adapter_fields(adapter: AdapterType) -> FsResult<Vec<ConfigField>> {
         AdapterType::Postgres => PostgresDbConfig::get_fields(),
         AdapterType::Redshift => RedshiftDbConfig::get_fields(),
         AdapterType::Fabric => FabricDbConfig::get_fields(),
+        AdapterType::SingleStore => SingleStoreDbConfig::get_fields(),
         other => {
             return Err(fs_err!(
                 ErrorCode::InvalidConfig,
@@ -258,6 +261,7 @@ pub fn build_profile_target(
             let config = apply_values(&default_fabric_config(), values)?;
             DbConfig::Fabric(Box::new(config))
         }
+        AdapterType::SingleStore => build_singlestore_profile_target(values)?,
         other => {
             return Err(fs_err!(
                 ErrorCode::InvalidConfig,
@@ -274,6 +278,17 @@ pub fn build_profile_target(
         target: target.to_string(),
         outputs,
     })
+}
+
+fn build_singlestore_profile_target(values: &HashMap<String, FieldValue>) -> FsResult<DbConfig> {
+    let mut config = apply_values(&SingleStoreDbConfig::default(), values)?;
+    if config.threads.is_none() {
+        config.threads = Some(StringOrInteger::Integer(16));
+    }
+    if config.schema.is_none() {
+        config.schema = config.database.clone();
+    }
+    Ok(DbConfig::SingleStore(Box::new(config)))
 }
 
 #[cfg(test)]

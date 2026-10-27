@@ -121,7 +121,8 @@ pub fn max_identifier_length(adapter_type: AdapterType) -> Option<NonZero<usize>
             Some(unsafe { NonZero::new_unchecked(127) })
         }
         Snowflake | Bigquery | Databricks | Spark | DuckDB | Salesforce | Fabric | ClickHouse
-        | Exasol | Athena | Starburst | Trino | Datafusion | Dremio | Oracle | LakeCompute => None,
+        | Exasol | Athena | Starburst | Trino | Datafusion | Dremio | Oracle | LakeCompute
+        | SingleStore => None,
     }
 }
 
@@ -139,7 +140,7 @@ pub fn max_identifier_length(adapter_type: AdapterType) -> Option<NonZero<usize>
 pub const fn canonical_quote(backend: AdapterType) -> QuotingStyle {
     use AdapterType::*;
     match backend {
-        Bigquery | Databricks | Spark | Athena => QuotingStyle::Backtick,
+        Bigquery | Databricks | Spark | Athena | SingleStore => QuotingStyle::Backtick,
         ClickHouse | Exasol | Snowflake | Redshift | Postgres | Salesforce | DuckDB => {
             QuotingStyle::Double
         }
@@ -177,7 +178,8 @@ pub fn is_valid_ident_char(c: char, backend: AdapterType) -> bool {
             | Dremio
             | Oracle
             | LakeCompute
-            | Exasol => c.is_alphanumeric() || c == '_',
+            | Exasol
+            | SingleStore => c.is_alphanumeric() || c == '_',
     }
 }
 
@@ -263,11 +265,15 @@ pub fn quote_identifier(id: &str, backend: AdapterType) -> String {
 /// value can never terminate the literal early. The literal-value member of
 /// the family next to [`sanitize_identifier`] (strip) and [`quote_identifier`]
 /// (quote), which handle identifiers.
-pub fn escape_string_literal(s: &str, _backend: AdapterType) -> String {
-    // ANSI '' doubling — correct for every currently supported backend.
-    // Dialects with different literal-escape rules (e.g. backslash-escaped
-    // strings) grow a match arm on `_backend` when they arrive.
-    s.replace('\'', "''")
+pub fn escape_string_literal(s: &str, backend: AdapterType) -> String {
+    match backend {
+        // MySQL-family string literals treat `\` as an escape character (the
+        // default sql_mode), so a trailing `\` would swallow the closing quote.
+        // Escape backslashes, then double single quotes.
+        AdapterType::SingleStore => s.replace('\\', "\\\\").replace('\'', "''"),
+        // ANSI '' doubling for every other backend.
+        _ => s.replace('\'', "''"),
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +305,16 @@ mod sanitize_tests {
         assert_eq!(e("o'brien"), "o''brien");
         assert_eq!(e("'; DROP TABLE x; --"), "''; DROP TABLE x; --");
         assert_eq!(e("plain"), "plain");
+    }
+
+    #[test]
+    fn singlestore_escape_string_literal_escapes_backslashes() {
+        let e = |s: &str| escape_string_literal(s, AdapterType::SingleStore);
+        assert_eq!(e("o'brien"), "o''brien");
+        assert_eq!(e("trailing\\"), "trailing\\\\");
+        assert_eq!(e("\\' or 1=1 -- "), "\\\\'' or 1=1 -- ");
+        // Other backends keep plain ANSI doubling.
+        assert_eq!(escape_string_literal("a\\b", AdapterType::DuckDB), "a\\b");
     }
 
     #[test]
