@@ -127,3 +127,15 @@ naming hook.
 - Python models are not supported.
 - Splitting one rebuild across several dbt invocations (one chunk per orchestrator task) is
   out of scope: it needs state that outlives the invocation.
+
+## Failure handling and operator recovery
+
+- **Failure before swap**: If chunk execution or batch loading fails before the swap, `abort` drops the shadow relation (`<model>__dbt_tmp`). The live target relation was never touched.
+- **Failure during swap (rollback succeeded)**: On two-step rename adapters (e.g., SingleStore), the live target is renamed to `<model>__dbt_backup`, then `<model>__dbt_tmp` is renamed to `<model>`. If the second rename fails, dbt attempts to restore `<model>__dbt_backup` back to `<model>`. If this rollback succeeds, the live relation retains its original data and the shadow table is dropped.
+- **Failure during swap (rollback failed / view upgrade)**: If the rollback rename fails, or if a pre-existing view was dropped before the rename failed, dbt preserves `<model>__dbt_tmp` to prevent unrecoverable data loss.
+  - `<model>__dbt_backup` holds the original pre-swap table data.
+  - `<model>__dbt_tmp` holds the newly built post-swap table data.
+  - **Operator Recovery**:
+    - To restore old data: rename `<model>__dbt_backup` to `<model>` (and drop `<model>__dbt_tmp` once verified).
+    - To promote new data: rename `<model>__dbt_tmp` to `<model>` (and drop `<model>__dbt_backup` once verified).
+  - Note: The next `dbt run` for this model drops lingering `<model>__dbt_tmp` and `<model>__dbt_backup` tables at the start of the build (`begin`), so operators should complete manual recovery before re-running the model.

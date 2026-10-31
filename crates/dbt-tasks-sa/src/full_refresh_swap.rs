@@ -156,7 +156,7 @@ impl ShadowBuild {
             &format!("load_cached_relation({TARGET}) is not none"),
         )
         .map(|v| v.is_true())
-        .unwrap_or(false);
+        .unwrap_or(true);
         let build = Self {
             shadow_model: Arc::new(shadow_model(model, &shadow_identifier, grants_after_swap)),
             grants_after_swap,
@@ -166,6 +166,7 @@ impl ShadowBuild {
             run_path,
         };
         build.drop_shadow(&env.jinja_env)?;
+        build.drop_backup(&env.jinja_env)?;
         debug!(
             "Rebuilding {} into {shadow_identifier} before swapping it in",
             model.unique_id()
@@ -290,7 +291,8 @@ impl ShadowBuild {
         error
     }
 
-    /// Drop the shadow after a failed rebuild. The target was never touched.
+    /// Drop the shadow after a failed rebuild. The target was restored or never
+    /// touched; preserves shadow if restore failed.
     /// If the target existed before the rebuild and the backup was not restored
     /// (or the target was dropped and not restored), preserve the shadow.
     pub fn abort(&self, jinja_env: &JinjaEnv) {
@@ -330,6 +332,16 @@ impl ShadowBuild {
             &self.context,
             &self.run_path,
             &format!("adapter.drop_relation({SHADOW})"),
+        )
+        .map(|_| ())
+    }
+
+    fn drop_backup(&self, jinja_env: &JinjaEnv) -> FsResult<()> {
+        eval(
+            jinja_env,
+            &self.context,
+            &self.run_path,
+            &format!("adapter.drop_relation({BACKUP})"),
         )
         .map(|_| ())
     }

@@ -1812,6 +1812,15 @@ impl Adapter {
                             "Failed to restore backup {} back to target {}: {}",
                             backup_val, target_val, restore_err
                         );
+                        return Err(minijinja::Error::new(
+                            minijinja::ErrorKind::InvalidOperation,
+                            format!(
+                                "Failed to swap shadow table {shadow_val} to target {target_val} ({e}). \
+                                 Attempted rollback to restore backup table {backup_val} to target {target_val} also failed ({restore_err}). \
+                                 Old data remains in backup table '{backup_val}' and new data in shadow table '{shadow_val}'. \
+                                 Manual operator intervention required."
+                            ),
+                        ));
                     }
                     return Err(e);
                 }
