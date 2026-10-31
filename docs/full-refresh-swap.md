@@ -32,6 +32,9 @@ is set.
 
 An ordinary incremental run is unchanged: it updates the live relation in place.
 
+> [!NOTE]
+> Running `--full-refresh` on a microbatch model with a narrow event-time window (e.g. `--event-time-start` and `--event-time-end`) replaces the entire live table with only that window's batches, identical to non-swap microbatch behavior. Swap does not merge back historical data outside the specified window.
+
 ## What happens
 
 1. The shadow and backup are named by `make_intermediate_relation` and
