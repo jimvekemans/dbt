@@ -97,7 +97,7 @@ pub struct ProjectSnapshotConfig {
     pub post_hook: Verbatim<Option<Hooks>>,
     #[serde(rename = "+persist_docs")]
     pub persist_docs: Option<PersistDocsConfig>,
-    #[serde(rename = "+grants")]
+    #[serde(default, rename = "+grants", skip_serializing_if = "OmissibleGrantConfig::is_omitted")]
     pub grants: OmissibleGrantConfig,
     #[serde(
         default,
@@ -568,7 +568,7 @@ pub struct SnapshotConfig {
     #[serde(alias = "post-hook")]
     pub post_hook: Verbatim<Option<Hooks>>,
     pub persist_docs: Option<PersistDocsConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "OmissibleGrantConfig::is_omitted")]
     pub grants: OmissibleGrantConfig,
     #[serde(default, deserialize_with = "event_time_or_map_to_string")]
     pub event_time: Option<String>,

@@ -73,7 +73,7 @@ pub struct ProjectSeedConfig {
     pub event_time: Option<String>,
     #[serde(rename = "+full_refresh")]
     pub full_refresh: Option<bool>,
-    #[serde(rename = "+grants")]
+    #[serde(default, rename = "+grants", skip_serializing_if = "OmissibleGrantConfig::is_omitted")]
     pub grants: OmissibleGrantConfig,
     #[serde(rename = "+group")]
     pub group: Option<String>,
@@ -462,7 +462,7 @@ pub struct SeedConfig {
     #[resolved(promote, method = get_enabled_with_default)]
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "OmissibleGrantConfig::is_omitted")]
     pub grants: OmissibleGrantConfig,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub quote_columns: Option<bool>,

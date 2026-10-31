@@ -67,7 +67,7 @@ pub struct ProjectFunctionConfig {
     pub docs: Option<DocsConfig>,
     #[serde(default, rename = "+enabled", deserialize_with = "bool_or_string_bool")]
     pub enabled: Option<bool>,
-    #[serde(rename = "+grants")]
+    #[serde(default, rename = "+grants", skip_serializing_if = "OmissibleGrantConfig::is_omitted")]
     pub grants: OmissibleGrantConfig,
     #[serde(rename = "+group")]
     pub group: Option<String>,
@@ -226,6 +226,7 @@ pub struct FunctionConfig {
     pub meta: Option<IndexMap<String, YmlValue>>,
     pub group: Option<String>,
     pub docs: Option<DocsConfig>,
+    #[serde(default, skip_serializing_if = "OmissibleGrantConfig::is_omitted")]
     pub grants: OmissibleGrantConfig,
     // Unlike models/seeds/snapshots, functions have no separate `Manifest*Config`: this
     // struct is what `ManifestFunction` serializes. So the field carries the manifest key

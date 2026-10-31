@@ -293,7 +293,7 @@ pub struct ProjectModelConfig {
     pub full_refresh: Option<bool>,
     #[serde(rename = "+grant_access_to")]
     pub grant_access_to: Option<Vec<GrantAccessToTarget>>,
-    #[serde(rename = "+grants")]
+    #[serde(default, rename = "+grants", skip_serializing_if = "OmissibleGrantConfig::is_omitted")]
     pub grants: OmissibleGrantConfig,
     #[serde(rename = "+group")]
     pub group: Option<String>,
@@ -991,6 +991,7 @@ pub struct ModelConfig {
     pub on_schema_change: Option<OnSchemaChange>,
     pub on_configuration_change: Option<OnConfigurationChange>,
     pub on_error: Option<OnError>,
+    #[serde(default, skip_serializing_if = "OmissibleGrantConfig::is_omitted")]
     pub grants: OmissibleGrantConfig,
     pub packages: Packages,
     #[serde(default, deserialize_with = "string_or_number_to_string")]
