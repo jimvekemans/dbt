@@ -1804,7 +1804,17 @@ impl Adapter {
             _ => {
                 self.drop_relation(state, std::slice::from_ref(backup_val))?;
                 self.rename_relation(state, &[target_val.clone(), backup_val.clone()])?;
-                self.rename_relation(state, &[shadow_val.clone(), target_val.clone()])?;
+                if let Err(e) = self.rename_relation(state, &[shadow_val.clone(), target_val.clone()]) {
+                    // Second rename failed: restore backup back to target so the live table remains untouched.
+                    let restore_res = self.rename_relation(state, &[backup_val.clone(), target_val.clone()]);
+                    if let Err(ref restore_err) = restore_res {
+                        tracing::error!(
+                            "Failed to restore backup {} back to target {}: {}",
+                            backup_val, target_val, restore_err
+                        );
+                    }
+                    return Err(e);
+                }
                 self.drop_relation(state, std::slice::from_ref(backup_val))?;
             }
         }
