@@ -399,7 +399,12 @@ impl Task for RunTask {
                             {
                                 // `full_refresh_strategy: swap` runs the batches against a
                                 // shadow relation and swaps it in after the last batch.
-                                let shadow_build = begin_microbatch_swap(mb_model, ctx).await?;
+                                let shadow_build = begin_microbatch_swap(
+                                    mb_model,
+                                    Some(task_result.sql_instruction.sql.clone()),
+                                    ctx,
+                                )
+                                .await?;
                                 let batch_node = shadow_build.as_ref().map_or_else(
                                     || self.node.clone(),
                                     |build| {
@@ -430,9 +435,14 @@ impl Task for RunTask {
                                     Ok::<bool, Box<dbt_common::FsError>>(had_batches)
                                 }
                                 .await;
-                                let had_batches =
-                                    finish_microbatch_swap(mb_model, shadow_build, batches, ctx)
-                                        .await?;
+                                let had_batches = finish_microbatch_swap(
+                                    mb_model,
+                                    shadow_build,
+                                    batches,
+                                    Some(task_result.sql_instruction.sql.clone()),
+                                    ctx,
+                                )
+                                .await?;
 
                                 // After all microbatch batches succeed, create the latest
                                 // version pointer view if applicable. Skip when no batches

@@ -90,6 +90,8 @@ pub struct ShadowBuild {
     /// Whether grants are applied to the target after the swap instead of to
     /// the shadow; see [`grants_follow_rename`].
     grants_after_swap: bool,
+    /// Whether the target relation existed in the database before the rebuild started.
+    target_existed_at_start: bool,
 }
 
 const TARGET: &str = "__dbt_swap_target";
@@ -147,9 +149,18 @@ impl ShadowBuild {
         context.insert(BACKUP.to_string(), backup);
 
         let grants_after_swap = !grants_follow_rename(env.adapter_type);
+        let target_existed_at_start = eval(
+            &env.jinja_env,
+            &context,
+            &run_path,
+            &format!("load_cached_relation({TARGET}) is not none"),
+        )
+        .map(|v| v.is_true())
+        .unwrap_or(false);
         let build = Self {
             shadow_model: Arc::new(shadow_model(model, &shadow_identifier, grants_after_swap)),
             grants_after_swap,
+            target_existed_at_start,
             alias: model.__base_attr__.alias.clone(),
             context,
             run_path,
@@ -257,7 +268,7 @@ impl ShadowBuild {
 
     /// Errors from the shadow's materialization name the shadow (its alias and
     /// run file); point them at the model the user knows instead.
-    fn relabel(&self, mut error: Box<FsError>, env: &SwapEnv<'_>) -> Box<FsError> {
+    pub fn relabel(&self, mut error: Box<FsError>, env: &SwapEnv<'_>) -> Box<FsError> {
         let shadow_path = self.shadow_model.get_node_path(
             NodePathKind::Executable,
             &env.io_args.in_dir,
@@ -280,11 +291,35 @@ impl ShadowBuild {
     }
 
     /// Drop the shadow after a failed rebuild. The target was never touched.
+    /// If the target existed before the rebuild and the backup was not restored
+    /// (or the target was dropped and not restored), preserve the shadow.
     pub fn abort(&self, jinja_env: &JinjaEnv) {
-        if let Err(e) = self.drop_shadow(jinja_env) {
+        let should_drop = if self.target_existed_at_start {
+            eval(
+                jinja_env,
+                &self.context,
+                &self.run_path,
+                &format!(
+                    "load_cached_relation({BACKUP}) is none and load_cached_relation({TARGET}) is not none"
+                ),
+            )
+            .map(|v| v.is_true())
+            .unwrap_or(false)
+        } else {
+            true
+        };
+
+        if should_drop {
+            if let Err(e) = self.drop_shadow(jinja_env) {
+                warn!(
+                    "Failed to drop {} after a failed rebuild: {e}",
+                    self.context[SHADOW]
+                );
+            }
+        } else {
             warn!(
-                "Failed to drop {} after a failed rebuild: {e}",
-                self.context[SHADOW]
+                "Preserving shadow {} after failed swap because target {} was not restored or backup {} remains",
+                self.context[SHADOW], self.context[TARGET], self.context[BACKUP]
             );
         }
     }
@@ -440,5 +475,60 @@ mod tests {
         assert!(grants_follow_rename(AdapterType::Postgres));
         assert!(grants_follow_rename(AdapterType::Snowflake));
         assert!(!grants_follow_rename(AdapterType::SingleStore));
+    }
+
+    #[test]
+    fn relabel_rewrites_shadow_name_and_path() {
+        let mut model = DbtModel {
+            deprecated_config: ModelConfig {
+                full_refresh_strategy: Some(FullRefreshStrategy::Swap),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        model.__common_attr__.unique_id = "model.p.my_model".to_string();
+        model.__base_attr__.alias = "my_model".to_string();
+        let shadow_build = ShadowBuild {
+            shadow_model: Arc::new(shadow_model(&model, "my_model__dbt_tmp", false)),
+            grants_after_swap: true,
+            target_existed_at_start: true,
+            alias: "my_model".to_string(),
+            context: BTreeMap::new(),
+            run_path: PathBuf::from("target/run/p/models/my_model.sql"),
+        };
+        let io_args = IoArgs {
+            in_dir: PathBuf::from("."),
+            out_dir: PathBuf::from("target"),
+            ..Default::default()
+        };
+        let runtime_config = DbtRuntimeConfig::default();
+        let resolver = Arc::new(MaterializationResolver::new(&BTreeMap::new(), "p"));
+        let jinja = Arc::new(JinjaEnv::new(minijinja::Environment::new()));
+        let base_ctx = BTreeMap::new();
+        let env = SwapEnv {
+            adapter_type: AdapterType::SingleStore,
+            runtime_config: &runtime_config,
+            materialization_resolver: &resolver,
+            jinja_env: jinja,
+            base_context: &base_ctx,
+            io_args: &io_args,
+        };
+        let shadow_path = shadow_build.shadow_model.get_node_path(
+            NodePathKind::Executable,
+            &env.io_args.in_dir,
+            &env.io_args.out_dir,
+        );
+        let shadow_label = format!(
+            "in model {} ({})",
+            shadow_build.shadow_model.__base_attr__.alias,
+            shadow_path.display()
+        );
+        let mut err = dbt_common::fs_err!(
+            ErrorCode::Generic,
+            "error {}", shadow_label
+        );
+        err = shadow_build.relabel(err, &env);
+        assert!(!err.context.contains("my_model__dbt_tmp"));
+        assert!(err.context.contains("in model my_model (target/run/p/models/my_model.sql)"));
     }
 }

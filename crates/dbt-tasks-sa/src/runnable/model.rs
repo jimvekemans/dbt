@@ -184,6 +184,7 @@ pub async fn prepare_microbatch_batches(
 /// returned build's `shadow_model`.
 pub async fn begin_microbatch_swap(
     model: &DbtModel,
+    sql: Option<String>,
     ctx: &TaskRunnerCtx,
 ) -> FsResult<Option<Arc<ShadowBuild>>> {
     if swap_plan(model)?.is_none() {
@@ -200,19 +201,20 @@ pub async fn begin_microbatch_swap(
             return Ok(None);
         }
         let base_context = ctx.run_base_context(&model)?;
-        ShadowBuild::begin(&model, None, &swap_env(&model, &ctx, &base_context))
+        ShadowBuild::begin(&model, sql.as_deref(), &swap_env(&model, &ctx, &base_context))
             .map(|build| Some(Arc::new(build)))
     })
     .await?
 }
 
 /// Complete or abandon a microbatch `swap` rebuild once its batches ran:
-/// swap the shadow in when at least one batch succeeded, drop it otherwise.
+/// swap the shadow in when all batches succeeded, drop it otherwise.
 /// Passes `batches` (whether any batch ran) through.
 pub async fn finish_microbatch_swap(
     model: &DbtModel,
     build: Option<Arc<ShadowBuild>>,
     batches: FsResult<bool>,
+    sql: Option<String>,
     ctx: &TaskRunnerCtx,
 ) -> FsResult<bool> {
     let Some(build) = build else {
@@ -224,7 +226,7 @@ pub async fn finish_microbatch_swap(
         Ok(true) => {
             let base_context = ctx.run_base_context(&model)?;
             build
-                .finish(&model, None, &swap_env(&model, &ctx, &base_context))
+                .finish(&model, sql.as_deref(), &swap_env(&model, &ctx, &base_context))
                 .inspect_err(|_| build.abort(&ctx.env))?;
             Ok(true)
         }
@@ -234,7 +236,9 @@ pub async fn finish_microbatch_swap(
         }
         Err(e) => {
             build.abort(&ctx.env);
-            Err(e)
+            let base_context = ctx.run_base_context(&model)?;
+            let env = swap_env(&model, &ctx, &base_context);
+            Err(build.relabel(e, &env))
         }
     })
     .await?
