@@ -1105,10 +1105,10 @@ impl Adapter {
                 let to_relation = downcast_value_to_dyn_base_relation(to_relation_val)?;
                 iter.finish()?;
 
+                adapter.rename_relation(state, &from_relation, &to_relation)?;
+
                 // Update cache (call the typed AdapterImpl directly since we already have refs)
                 adapter.cache_renamed(state, &from_relation, &to_relation)?;
-
-                adapter.rename_relation(state, &from_relation, &to_relation)?;
                 Ok(Value::from(()))
             }
             Parse(_) => Ok(none_value()),
