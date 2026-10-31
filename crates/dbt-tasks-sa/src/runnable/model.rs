@@ -236,9 +236,12 @@ pub async fn finish_microbatch_swap(
         }
         Err(e) => {
             build.abort(&ctx.env);
-            let base_context = ctx.run_base_context(&model)?;
-            let env = swap_env(&model, &ctx, &base_context);
-            Err(build.relabel(e, &env))
+            if let Ok(base_context) = ctx.run_base_context(&model) {
+                let env = swap_env(&model, &ctx, &base_context);
+                Err(build.relabel(e, &env))
+            } else {
+                Err(e)
+            }
         }
     })
     .await?
