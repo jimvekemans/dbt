@@ -3258,5 +3258,25 @@ __additional_properties__: {}
             assert_eq!(materialized, None);
             assert_eq!(table_format, None);
         }
+
+        #[test]
+        fn test_model_config_grants_serialization_omitted_vs_explicit_empty() {
+            use crate::schemas::serde::{GrantConfig, OmissibleGrantConfig};
+            use dbt_common::serde_utils::Omissible;
+            use indexmap::IndexMap;
+
+            // Default ModelConfig has omitted grants: must be omitted from serialization
+            let default_config = ModelConfig::default();
+            let json_omitted = serde_json::to_string(&default_config).unwrap();
+            assert!(!json_omitted.contains("\"grants\""));
+
+            // ModelConfig with explicit empty grants: must serialize as "grants":{}
+            let explicit_empty_config = ModelConfig {
+                grants: OmissibleGrantConfig(Omissible::Present(GrantConfig(IndexMap::new()))),
+                ..Default::default()
+            };
+            let json_empty = serde_json::to_string(&explicit_empty_config).unwrap();
+            assert!(json_empty.contains("\"grants\":{}"));
+        }
     }
 }
