@@ -149,14 +149,25 @@ impl ShadowBuild {
         context.insert(BACKUP.to_string(), backup);
 
         let grants_after_swap = !grants_follow_rename(env.adapter_type);
-        let target_existed_at_start = eval(
+        let target_eval_result = eval(
             &env.jinja_env,
             &context,
             &run_path,
             &format!("load_cached_relation({TARGET}) is not none"),
-        )
-        .map(|v| v.is_true())
-        .unwrap_or(true);
+        );
+        let confirmed_target_exists = match &target_eval_result {
+            Ok(v) => v.is_true(),
+            Err(e) => {
+                warn!(
+                    "Failed to check if target exists for {}: {e}",
+                    model.unique_id()
+                );
+                false
+            }
+        };
+        let target_existed_at_start = target_eval_result
+            .map(|v| v.is_true())
+            .unwrap_or(true);
         let build = Self {
             shadow_model: Arc::new(shadow_model(model, &shadow_identifier, grants_after_swap)),
             grants_after_swap,
@@ -166,7 +177,7 @@ impl ShadowBuild {
             run_path,
         };
         build.drop_shadow(&env.jinja_env)?;
-        if target_existed_at_start {
+        if confirmed_target_exists {
             build.drop_backup(&env.jinja_env)?;
         }
         debug!(
