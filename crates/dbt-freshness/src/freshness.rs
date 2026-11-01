@@ -513,7 +513,7 @@ async fn calculate_freshness_common(
 
     let max_loaded_at = cast_with_options(
         max_loaded_at_column.as_ref(),
-        &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         &STRICT_CAST,
     )?
     .as_primitive::<TimestampNanosecondType>()
@@ -521,7 +521,7 @@ async fn calculate_freshness_common(
 
     let snapshotted_at = cast_with_options(
         snapshotted_at.as_ref(),
-        &DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         &STRICT_CAST,
     )?
     .as_primitive::<TimestampNanosecondType>()
