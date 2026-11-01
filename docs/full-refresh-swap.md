@@ -138,4 +138,4 @@ naming hook.
   - **Operator Recovery**:
     - To restore old data: rename `<model>__dbt_backup` to `<model>` (and drop `<model>__dbt_tmp` once verified).
     - To promote new data: rename `<model>__dbt_tmp` to `<model>` (and drop `<model>__dbt_backup` once verified).
-  - Note: The next `dbt run` for this model drops lingering `<model>__dbt_tmp` and `<model>__dbt_backup` tables at the start of the build (`begin`), so operators should complete manual recovery before re-running the model.
+  - Note: Lingering `<model>__dbt_backup` tables are only cleared at the start of a build (`begin`) when the live target table exists. If a previous run failed mid-swap leaving only the backup (and no target), `<model>__dbt_backup` is preserved so that any subsequent build failure will not cause data loss. Operators should still complete manual recovery before re-running the model.

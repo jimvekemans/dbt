@@ -166,7 +166,9 @@ impl ShadowBuild {
             run_path,
         };
         build.drop_shadow(&env.jinja_env)?;
-        build.drop_backup(&env.jinja_env)?;
+        if target_existed_at_start {
+            build.drop_backup(&env.jinja_env)?;
+        }
         debug!(
             "Rebuilding {} into {shadow_identifier} before swapping it in",
             model.unique_id()
