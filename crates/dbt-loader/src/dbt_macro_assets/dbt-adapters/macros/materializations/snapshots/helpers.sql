@@ -165,7 +165,7 @@
 
             {%- if strategy.hard_deletes == 'new_record' %}
             and not (
-                --avoid updating the record's valid_to if the latest entry is marked as deleted
+                -- avoid updating the record's valid_to if the latest entry is marked as deleted
                 snapshotted_data.{{ columns.dbt_is_deleted }} = 'True'
                 and
                 {% if config.get('dbt_valid_to_current') -%}
@@ -210,7 +210,7 @@
             on {{ unique_key_join_on(strategy.unique_key, "snapshotted_data", "source_data") }}
         where {{ unique_key_is_null(strategy.unique_key, "source_data") }}
         and not (
-            --avoid inserting a new record if the latest one is marked as deleted
+            -- avoid inserting a new record if the latest one is marked as deleted
             snapshotted_data.{{ columns.dbt_is_deleted }} = 'True'
             and
             {% if config.get('dbt_valid_to_current') -%}
@@ -308,7 +308,13 @@
 
 
 -- funcsign: (strategy, list[base_column]) -> string
-{% macro get_dbt_valid_to_current(strategy, columns) %}
+{% macro get_dbt_valid_to_current(strategy, columns) -%}
+  {{ adapter.dispatch('get_dbt_valid_to_current', 'dbt')(strategy, columns) }}
+{%- endmacro %}
+
+
+-- funcsign: (strategy, list[base_column]) -> string
+{% macro default__get_dbt_valid_to_current(strategy, columns) %}
   {% set dbt_valid_to_current = config.get('dbt_valid_to_current') or "null" %}
   coalesce(nullif({{ strategy.updated_at }}, {{ strategy.updated_at }}), {{dbt_valid_to_current}})
   as {{ columns.dbt_valid_to }}

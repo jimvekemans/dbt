@@ -138,6 +138,7 @@ pub(crate) mod metadata_adapter;
 pub(crate) mod postgres;
 pub(crate) mod redshift;
 pub(crate) mod salesforce;
+pub(crate) mod singlestore;
 pub mod snowflake; // XXX: temporarily pub before the refactor is complete
 pub(crate) mod spark;
 pub(crate) mod view_definition;
@@ -209,14 +210,26 @@ impl fmt::Display for CatalogAndSchema {
 
 impl From<&dyn BaseRelation> for CatalogAndSchema {
     fn from(relation: &dyn BaseRelation) -> Self {
-        let resolved_catalog = relation.database_as_resolved_str().unwrap_or_default();
+        // Scope include_policy checks to SingleStore: other two-tier adapters (e.g.
+        // ClickHouse, Exasol) rely on semantic_fqn / CatalogAndSchema ignoring
+        // include_policy for relation cache keys.
+        let is_singlestore = relation.adapter_type() == AdapterType::SingleStore;
+        let resolved_catalog = if is_singlestore && !relation.include_policy().database {
+            Cow::Borrowed("")
+        } else {
+            relation.database_as_resolved_str().unwrap_or_default()
+        };
         let rendered_catalog = if resolved_catalog.is_empty() {
             "".to_string()
         } else {
             relation.quoted(&resolved_catalog)
         };
 
-        let resolved_schema = relation.schema_as_resolved_str().unwrap_or_default();
+        let resolved_schema = if is_singlestore && !relation.include_policy().schema {
+            Cow::Borrowed("")
+        } else {
+            relation.schema_as_resolved_str().unwrap_or_default()
+        };
         let rendered_schema = if resolved_schema.is_empty() {
             "".to_string()
         } else {

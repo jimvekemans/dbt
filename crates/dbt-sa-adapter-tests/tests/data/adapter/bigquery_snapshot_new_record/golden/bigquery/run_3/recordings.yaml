@@ -192,7 +192,7 @@ snapshot.bigquery_snapshot_new_record.snapshot_of_source:
     
     
     and not (
-    --avoid updating the record's valid_to if the latest entry is marked as deleted
+    -- avoid updating the record's valid_to if the latest entry is marked as deleted
     snapshotted_data.dbt_is_deleted = 'True'
     and
     snapshotted_data.dbt_valid_to is null
@@ -229,7 +229,7 @@ snapshot.bigquery_snapshot_new_record.snapshot_of_source:
     
     
     and not (
-    --avoid inserting a new record if the latest one is marked as deleted
+    -- avoid inserting a new record if the latest one is marked as deleted
     snapshotted_data.dbt_is_deleted = 'True'
     and
     snapshotted_data.dbt_valid_to is null
@@ -396,7 +396,7 @@ snapshot.bigquery_snapshot_new_record.snapshot_of_source:
     
     
     and not (
-    --avoid updating the record's valid_to if the latest entry is marked as deleted
+    -- avoid updating the record's valid_to if the latest entry is marked as deleted
     snapshotted_data.dbt_is_deleted = 'True'
     and
     snapshotted_data.dbt_valid_to is null
@@ -433,7 +433,7 @@ snapshot.bigquery_snapshot_new_record.snapshot_of_source:
     
     
     and not (
-    --avoid inserting a new record if the latest one is marked as deleted
+    -- avoid inserting a new record if the latest one is marked as deleted
     snapshotted_data.dbt_is_deleted = 'True'
     and
     snapshotted_data.dbt_valid_to is null

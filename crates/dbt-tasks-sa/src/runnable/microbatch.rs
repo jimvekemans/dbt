@@ -241,6 +241,7 @@ pub fn render_batch_sql(
     jinja_env: Arc<JinjaEnv>,
     jinja_context: &BTreeMap<String, Value>,
     out_dir: &Path,
+    adapter_type: Option<AdapterType>,
 ) -> FsResult<String> {
     // Render the raw SQL through Jinja
     // The context already contains config from build_run_node_context
@@ -259,6 +260,7 @@ pub fn render_batch_sql(
         "microbatch_not_persisted", // can be anything; only used to persist an ephemeral model
         false,                      // a microbatch model cannot be ephemeral
         &out_dir.join(DBT_EPHEMERAL_DIR_NAME),
+        adapter_type,
     )?;
 
     tracing::debug!("Rendered batch SQL w/ injected CTE (first 200 chars): {rendered:.200}...",);

@@ -142,6 +142,7 @@ fn render_default(
         &node.base().alias,
         node.materialized() == DbtMaterialization::Ephemeral,
         &ctx.inner.arg.io.out_dir.join(DBT_EPHEMERAL_DIR_NAME),
+        Some(ctx.adapter_type_for(node.as_ref())),
     )
     .map_err(|e| e.with_location(render_file_path.clone()))?;
 

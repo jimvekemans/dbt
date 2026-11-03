@@ -5,6 +5,7 @@ use crate::schemas::common::ResolvedQuoting;
 pub use crate::schemas::dbt_catalogs::TableFormat;
 
 use chrono::format::SecondsFormat;
+use chrono::{DateTime, Utc};
 use dbt_adapter_core::{AdapterType, quote_char};
 use dbt_common::FsResult;
 use dbt_common::constants::DBT_CTE_PREFIX;
@@ -444,11 +445,22 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
             }
         }
 
-        if let Ok(schema) = self.schema_as_str() {
-            if self.quote_policy().schema {
-                parts.push(self.quoted(&schema));
-            } else {
-                parts.push(self.quoted(&self.normalize_component(&schema)));
+        // Scope include_policy().schema to SingleStore: other two-tier adapters (e.g.
+        // ClickHouse, Exasol) set include_policy.schema = false for SQL rendering while
+        // still keying the relation cache by database.schema.identifier in semantic_fqn.
+        let include_schema = if self.adapter_type() == AdapterType::SingleStore {
+            self.include_policy().schema
+        } else {
+            true
+        };
+
+        if include_schema {
+            if let Ok(schema) = self.schema_as_str() {
+                if self.quote_policy().schema {
+                    parts.push(self.quoted(&schema));
+                } else {
+                    parts.push(self.quoted(&self.normalize_component(&schema)));
+                }
             }
         }
 
@@ -554,6 +566,19 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
                 start.map(|t| t.to_rfc3339_opts(SecondsFormat::Micros, true)),
                 end.map(|t| t.to_rfc3339_opts(SecondsFormat::Micros, true)),
             ),
+            // SingleStore does not accept ISO 'T' or time-zone offset in DATE/DATETIME comparisons.
+            // Format as 'YYYY-MM-DD HH:MM:SS[.ffffff]'.
+            // Upstream reference: https://github.com/memsql/dbt-singlestore/blob/master/dbt/include/singlestore/macros/materializations/incremental/incremental.sql#L99-L107
+            AdapterType::SingleStore => {
+                let to_ss_ts = |t: DateTime<Utc>| {
+                    if t.timestamp_subsec_nanos() == 0 {
+                        t.format("%Y-%m-%d %H:%M:%S").to_string()
+                    } else {
+                        t.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+                    }
+                };
+                (start.map(to_ss_ts), end.map(to_ss_ts))
+            }
             _ => (start.map(|t| t.to_rfc3339()), end.map(|t| t.to_rfc3339())),
         };
 
@@ -578,7 +603,8 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
             | AdapterType::Spark
             | AdapterType::DuckDB
             | AdapterType::LakeCompute
-            | AdapterType::Fabric => (
+            | AdapterType::Fabric
+            | AdapterType::SingleStore => (
                 start.map(|start| format!("{event_time} >= '{start}'")),
                 end.map(|end| format!("{event_time} < '{end}'")),
             ),

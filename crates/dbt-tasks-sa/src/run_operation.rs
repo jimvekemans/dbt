@@ -121,6 +121,7 @@ pub async fn run_operation_inline_sql(
             INLINE_SQL_NAME,
             /* is_current_model_ephemeral = */ false,
             &io_args.out_dir.join(DBT_EPHEMERAL_DIR_NAME),
+            Some(resolver_state.adapter_type),
         )?
     } else {
         rendered_user_sql
@@ -228,6 +229,7 @@ fn precompile_ephemeral_models(
             &model.__base_attr__.alias,
             /* is_current_model_ephemeral = */ true,
             &ephemeral_dir,
+            Some(resolver_state.adapter_type),
         )?;
     }
 
