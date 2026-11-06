@@ -6,6 +6,7 @@
 #![allow(clippy::only_used_in_recursion)]
 #![allow(clippy::should_implement_trait)]
 
+pub mod chunking;
 pub mod ident;
 pub mod statements;
 pub mod tokenizer;

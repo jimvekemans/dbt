@@ -25,7 +25,7 @@ use crate::schemas::dbt_column::Granularity;
 use crate::schemas::project::configs::common::{
     LazyWarehouseSpecificNodeConfig, WarehouseSpecificNodeConfig,
 };
-use crate::schemas::project::configs::model_config::LatestVersionPointer;
+use crate::schemas::project::configs::model_config::{FullRefreshStrategy, LatestVersionPointer};
 use crate::schemas::properties::{ModelFreshness, ModelState};
 
 use crate::schemas::serde::{bool_or_string_bool, string_or_number_to_string};
@@ -972,6 +972,12 @@ pub struct ManifestModelConfig {
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub concurrent_batches: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_refresh_strategy: Option<FullRefreshStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_output_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub merge_update_columns: Option<StringOrArrayOfStrings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merge_exclude_columns: Option<StringOrArrayOfStrings>,
@@ -1231,6 +1237,9 @@ impl From<ModelConfig> for ManifestModelConfig {
             contract: config.contract,
             event_time: config.event_time,
             concurrent_batches: config.concurrent_batches,
+            full_refresh_strategy: config.full_refresh_strategy,
+            chunks: config.chunks,
+            chunk_output_by: config.chunk_output_by.clone(),
             merge_update_columns: config.merge_update_columns,
             merge_exclude_columns: config.merge_exclude_columns,
             access: config.access,
@@ -1315,6 +1324,9 @@ impl From<ManifestModelConfig> for ModelConfig {
             contract: config.contract,
             event_time: config.event_time,
             concurrent_batches: config.concurrent_batches,
+            full_refresh_strategy: config.full_refresh_strategy,
+            chunks: config.chunks,
+            chunk_output_by: config.chunk_output_by.clone(),
             merge_update_columns: config.merge_update_columns,
             merge_exclude_columns: config.merge_exclude_columns,
             access: config.access,
