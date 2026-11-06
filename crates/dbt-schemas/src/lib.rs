@@ -50,6 +50,7 @@ pub mod schemas {
     };
     pub use user_settings::UserSettings;
 
+    pub mod full_refresh_swap;
     pub mod nodes;
     pub use nodes::{
         AbsorbedOverload, AdapterAttr, CommonAttributes, DbtAnalysis, DbtAnalysisAttr, DbtCheck,
@@ -196,7 +197,8 @@ pub mod schemas {
             MetricConfig, ProjectMetricConfigs, ResolvedMetricConfig,
         };
         pub use configs::model_config::{
-            LatestVersionPointer, ModelConfig, ProjectModelConfig, ResolvedModelConfig,
+            FullRefreshStrategy, LatestVersionPointer, ModelConfig, ProjectModelConfig,
+            ResolvedModelConfig,
         };
         pub use configs::saved_query_config::{
             ExportConfigExportAs, ResolvedSavedQueryConfig, SavedQueryCache, SavedQueryConfig,

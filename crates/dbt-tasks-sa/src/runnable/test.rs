@@ -6,10 +6,13 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::SystemTime;
 
+use crate::full_refresh_swap::{ShadowBuild, replace_relation};
 use crate::materialize::materialize_test;
+use crate::renderable::renderable::default::render_default;
 use dbt_common::FsResult;
 use dbt_common::constants::{DBT_AGGREGATED_GENERIC_TEST_CONTEXT, RUNNING};
 use dbt_common::stats::{NodeStatus, Stat};
+use dbt_common::tracing::dbt_emit::{emit_info_log_message, emit_warn_log_message};
 use dbt_common::tracing::dbt_metrics::{FusionMetricKey, InvocationMetricKey};
 use dbt_common::tracing::metrics::increment_metric;
 use dbt_common::tracing::span_info::{
@@ -21,8 +24,8 @@ use dbt_common::warn_error_options::{
 use dbt_common::{ErrorCode, fs_err, unexpected_fs_err};
 use dbt_pretty_table::{make_column_names, pretty_data_table};
 use dbt_scheduler::instructions::SqlInstruction;
-use dbt_schemas::schemas::DbtTest;
 use dbt_schemas::schemas::common::Severity;
+use dbt_schemas::schemas::{DbtModel, DbtTest};
 use dbt_schemas::schemas::{InternalDbtNode, InternalDbtNodeAttributes, NodePathKind};
 use dbt_tasks_core::context::{BlockingTaskCtx, TaskRunnerCtx};
 use dbt_tasks_core::pretty_table::from_pretty_table_error;
@@ -685,6 +688,98 @@ fn execute_test_remote_inner(
             should_error: test_result.should_error,
         }),
     })
+}
+
+/// Run the data tests of a `swap` model that this invocation selected (as
+/// `dbt build` does) against the complete shadow, before it is swapped in. A
+/// failing test keeps the live relation; the tests still run as usual after a
+/// successful swap. Each test is rendered as for the live relation and pointed
+/// at the shadow by replacing the relation's name in its SQL.
+pub fn test_shadow_before_swap(
+    model: &DbtModel,
+    build: &ShadowBuild,
+    ctx: &TaskRunnerCtx,
+) -> FsResult<()> {
+    let model_id = &model.__common_attr__.unique_id;
+    let tests = ctx
+        .nodes()
+        .tests
+        .values()
+        .filter(|test| {
+            ctx.inner
+                .runnable_set
+                .contains(&test.__common_attr__.unique_id)
+        })
+        .filter(|test| test.base().depends_on.nodes.contains(model_id))
+        .cloned()
+        .collect::<Vec<Arc<DbtTest>>>();
+    if tests.is_empty() {
+        return Ok(());
+    }
+    let (live, shadow) = build.relation_names();
+    let mut ran = 0;
+    let mut failed = Vec::new();
+    for test in &tests {
+        let test_id = &test.__common_attr__.unique_id;
+        let node = ctx
+            .nodes()
+            .get_node_owned(test_id)
+            .ok_or_else(|| unexpected_fs_err!("Test {test_id} is not in the node graph"))?;
+        let (instruction, _) = render_default(&node, &mut ctx.clone(), &None)?;
+        let (sql, replaced) = replace_relation(&instruction.sql, &live, &shadow);
+        if replaced == 0 {
+            emit_warn_log_message(
+                ErrorCode::SwapPreSwapTestSkipped,
+                format!(
+                    "{test_id} does not reference {live} by name, so it did not run against {shadow} before the swap; it runs against {live} after the swap"
+                ),
+            );
+            continue;
+        }
+        let adapter = ctx.adapter_for(test.as_ref())?;
+        let base_context = ctx.run_base_context(test.as_ref())?;
+        let (results, _, _) = materialize_test(
+            &sql,
+            test,
+            ctx.generic_test_relationships(),
+            &adapter,
+            ctx.runtime_config(),
+            &ctx.inner.materialization_resolver,
+            ctx.env.clone(),
+            &base_context,
+            &ctx.inner.arg.io,
+        )?;
+        ran += 1;
+        if let Some(result) = results.first() {
+            let status = status_with_warn_error_overrides(
+                reported_test_verdict_from_materialize_result(
+                    test.deprecated_config.severity.as_ref(),
+                    result,
+                ),
+                &ctx.inner.arg.warn_error_options,
+            );
+            if matches!(status, TestExecutionStatus::Failed) {
+                failed.push(format!(
+                    "{} ({} failures)",
+                    test.__common_attr__.name, result.failures
+                ));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        return Err(fs_err!(
+            ErrorCode::SwapPreSwapTestFailed,
+            "{} of {ran} tests failed against the rebuilt data in {shadow}, so {live} was not replaced: {}",
+            failed.len(),
+            failed.join(", ")
+        ));
+    }
+    if ran > 0 {
+        emit_info_log_message(format!(
+            "Tested {shadow} before the swap: {ran} tests passed"
+        ));
+    }
+    Ok(())
 }
 
 /// Process test execution result and record metrics/stats

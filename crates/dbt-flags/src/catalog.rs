@@ -94,6 +94,23 @@ pub static LAKECOMPUTE_PROFILE_SETUP: FlagDef = FlagDef {
     docs_url: None,
 };
 
+/// After a chunked rebuild, compare the result with the model SQL run without
+/// its `get_chunk_filter` predicates, and fail the model when they differ. For
+/// CI on small data: the comparison runs the whole unchunked query.
+pub static VERIFY_CHUNKED_REBUILDS: FlagDef = FlagDef {
+    name: "verify_chunked_rebuilds",
+    description: "After a chunked rebuild, compare it with the unchunked model SQL and fail \
+                  the model when they differ (before the swap, for swap models).",
+    stage: Stage::Preview,
+    default: false,
+    remote: Remote::Never,
+    aliases: &[],
+    legacy_env: &[],
+    tracking: None,
+    remove_by: None,
+    docs_url: None,
+};
+
 /// Every flag declared in this crate.
 pub static ALL: &[&FlagDef] = &[
     &GIT_DEPS_FAST_PATH,
@@ -102,6 +119,7 @@ pub static ALL: &[&FlagDef] = &[
     &FRONTEND_LIBRARY,
     &LOCK_WITH_STATE,
     &LAKECOMPUTE_PROFILE_SETUP,
+    &VERIFY_CHUNKED_REBUILDS,
 ];
 
 #[cfg(test)]

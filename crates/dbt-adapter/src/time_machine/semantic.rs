@@ -73,6 +73,7 @@ impl SemanticCategory {
             | "add_query"
             | "drop_relation"
             | "rename_relation"
+            | "swap_relations"
             | "truncate_relation"
             | "create_schema"
             | "drop_schema"
@@ -159,7 +160,8 @@ impl SemanticCategory {
             | "get_csv_data"
             | "table_format"
             | "warn_once"
-            | "strip_trailing_statement_terminator" => SemanticCategory::Pure,
+            | "strip_trailing_statement_terminator"
+            | "chunk_predicate" => SemanticCategory::Pure,
 
             _ => {
                 debug_assert!(

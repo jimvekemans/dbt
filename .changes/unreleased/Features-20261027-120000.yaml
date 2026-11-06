@@ -1,0 +1,7 @@
+kind: Features
+body: Add `full_refresh_strategy: swap` to rebuild table and incremental models into a shadow relation, optionally in hash `chunks`, and swap it in only after the rebuild succeeds. The chunk predicate and swap are overridable through the dispatched `get_chunk_predicate` and `swap_relations` macros.
+time: 2026-10-27T12:00:00.000000+01:00
+custom:
+    author: jimvekemans
+    issue: ''
+    project: dbt-core
