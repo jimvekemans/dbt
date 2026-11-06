@@ -526,6 +526,12 @@ impl GraphBuilder {
                 &runnable_node_index_map,
                 &mut graph,
             );
+            add_swap_pre_test_dependencies(
+                run_nodes,
+                nodes,
+                &runnable_node_index_map,
+                &mut graph,
+            );
         }
 
         // Insert barrier only for static nodes
@@ -1101,6 +1107,52 @@ fn add_test_to_model_dependencies(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Order other nodes read by a `swap` model's selected data tests before the
+/// `swap` model's `Run` task whenever doing so does not introduce a cycle, so
+/// `test_shadow_before_swap` sees their freshly built relations instead of
+/// skipping the pre-swap test with `dbt1421`.
+fn add_swap_pre_test_dependencies(
+    run_nodes: &BTreeMap<String, Arc<dyn Task>>,
+    nodes: &Nodes,
+    runnable_node_index_map: &BTreeMap<String, NodeIndex>,
+    graph: &mut DiGraph<Arc<dyn Task>, ()>,
+) {
+    use dbt_schemas::schemas::project::FullRefreshStrategy;
+    for test_id in run_nodes.keys().filter(|id| id.starts_with("test.")) {
+        let Some(test) = nodes.tests.get(test_id) else {
+            continue;
+        };
+        let test_deps = &test.base().depends_on.nodes;
+        if test_deps.len() < 2 {
+            continue;
+        }
+        for model_id in test_deps {
+            let is_swap = nodes
+                .models
+                .get(model_id)
+                .and_then(|m| m.deprecated_config.full_refresh_strategy)
+                == Some(FullRefreshStrategy::Swap);
+            if !is_swap {
+                continue;
+            }
+            let Some(&model_idx) = runnable_node_index_map.get(model_id) else {
+                continue;
+            };
+            for other_id in test_deps {
+                if other_id == model_id {
+                    continue;
+                }
+                let Some(&other_idx) = runnable_node_index_map.get(other_id) else {
+                    continue;
+                };
+                if !petgraph::algo::has_path_connecting(&*graph, model_idx, other_idx, None) {
+                    graph.update_edge(other_idx, model_idx, ());
                 }
             }
         }

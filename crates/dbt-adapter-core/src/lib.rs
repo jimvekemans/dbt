@@ -145,6 +145,20 @@ pub fn quote_char(adapter_type: AdapterType) -> char {
     }
 }
 
+/// Whether a renamed relation keeps its grants. Where it does, grants go on the
+/// shadow and readers keep access across a `swap` rebuild. SingleStore keys
+/// privileges by table name: grants on the shadow would stay behind on its old
+/// name, and the target name keeps the grants of the relation swapped out.
+pub const fn grants_follow_rename(adapter_type: AdapterType) -> bool {
+    use AdapterType::*;
+    match adapter_type {
+        SingleStore => false,
+        Snowflake | Bigquery | Databricks | Redshift | Spark | DuckDB | Postgres | Salesforce
+        | Fabric | ClickHouse | Exasol | Athena | Starburst | Trino | Datafusion | Dremio
+        | Oracle | LakeCompute => true,
+    }
+}
+
 pub const DBT_EXECUTION_PHASE_RENDER: &str = "render";
 pub const DBT_EXECUTION_PHASE_ANALYZE: &str = "analyze";
 pub const DBT_EXECUTION_PHASE_RUN: &str = "run";

@@ -17,6 +17,7 @@ pub mod constraints;
 pub mod debug;
 pub mod experimental;
 pub mod extract_sources;
+pub mod full_refresh_swap;
 pub mod graph;
 pub mod materialize;
 pub mod microbatch;

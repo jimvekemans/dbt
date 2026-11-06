@@ -818,3 +818,102 @@ fn test_singlestore_drop_stale_temp_and_backup_relations() {
         "expected drop of aged backup relation: {all_calls:?}"
     );
 }
+
+#[test]
+fn test_full_refresh_swap_get_chunk_predicate_default_and_override() {
+    let harness = MacroTestHarness::for_adapter(AdapterType::SingleStore)
+        .load_all_macros()
+        .build()
+        .expect("harness should build");
+
+    harness.mock().on("chunk_predicate", |args| {
+        let col = args.first().and_then(Value::as_str).unwrap_or("");
+        let chunks = args.get(1).and_then(Value::as_i64).unwrap_or(0);
+        let chunk = args.get(2).and_then(Value::as_i64).unwrap_or(0);
+        Ok(Value::from(format!("crc32({col}) % {chunks} = {chunk}")))
+    });
+
+    let rendered = harness
+        .render(
+            "{{ get_chunk_predicate('order_id', 4, 2) }}",
+            BTreeMap::<String, Value>::new(),
+        )
+        .expect("get_chunk_predicate should dispatch to default__get_chunk_predicate");
+    assert_eq!(rendered.trim(), "crc32(order_id) % 4 = 2");
+
+    // Verify project-level singlestore__get_chunk_predicate override is dispatched
+    let override_harness = MacroTestHarness::for_adapter(AdapterType::SingleStore)
+        .with_root_package("swap_override_project")
+        .load_all_macros()
+        .with_macro(
+            "swap_override_project",
+            "singlestore__get_chunk_predicate",
+            "{% macro singlestore__get_chunk_predicate(column, chunks, chunk) %}({{ column }} % {{ chunks }} = {{ chunk }}){% endmacro %}",
+        )
+        .build()
+        .expect("override harness should build");
+
+    let rendered_override = override_harness
+        .render(
+            "{{ get_chunk_predicate('order_id', 4, 2) }}",
+            BTreeMap::<String, Value>::new(),
+        )
+        .expect("get_chunk_predicate should dispatch to singlestore__get_chunk_predicate");
+    assert_eq!(rendered_override.trim(), "(order_id % 4 = 2)");
+}
+
+#[test]
+fn test_full_refresh_swap_relations_default_and_override() {
+    let harness = MacroTestHarness::for_adapter(AdapterType::SingleStore)
+        .load_all_macros()
+        .build()
+        .expect("harness should build");
+
+    harness
+        .mock()
+        .on("swap_relations", |_args| Ok(Value::from(())));
+
+    let target = RelationObject::new(harness.relation(
+        "my_db",
+        "my_db",
+        "orders",
+        Some(RelationType::Table),
+    ))
+    .into_value();
+    let shadow = RelationObject::new(harness.relation(
+        "my_db",
+        "my_db",
+        "orders__dbt_tmp_1234567890",
+        Some(RelationType::Table),
+    ))
+    .into_value();
+    let backup = RelationObject::new(harness.relation(
+        "my_db",
+        "my_db",
+        "orders__dbt_backup_1234567890",
+        Some(RelationType::Table),
+    ))
+    .into_value();
+
+    let ctx = BTreeMap::from([
+        ("target".to_string(), target),
+        ("shadow".to_string(), shadow),
+        ("backup".to_string(), backup),
+    ]);
+
+    harness
+        .render("{{ swap_relations(target, shadow, backup) }}", ctx.clone())
+        .expect("swap_relations should dispatch to adapter.swap_relations");
+
+    let calls = harness.mock().observed_calls();
+    assert!(
+        calls.iter().any(|c| {
+            let args_str = format!("{:?}", c.args);
+            c.method == "swap_relations"
+                && args_str.contains("orders")
+                && args_str.contains("orders__dbt_tmp_1234567890")
+                && args_str.contains("orders__dbt_backup_1234567890")
+        }),
+        "expected adapter.swap_relations call with target, shadow, backup: {calls:?}"
+    );
+}

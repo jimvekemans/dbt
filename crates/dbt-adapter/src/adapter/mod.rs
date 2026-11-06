@@ -1668,6 +1668,61 @@ impl Adapter {
         }
     }
 
+    /// SQL boolean selecting chunk `chunk` (0-based) of `chunks` hash chunks
+    /// on `column`. Default for the `get_chunk_predicate` macro, used by the
+    /// `full_refresh_strategy: swap` rebuild.
+    #[tracing::instrument(skip(self, _state), level = "trace")]
+    pub fn chunk_predicate(
+        &self,
+        _state: &State,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        let iter = ArgsIter::new("chunk_predicate", &["column", "chunks", "chunk"], args);
+        let column = iter.next_arg::<String>()?;
+        let chunks = iter.next_arg::<u64>()?;
+        let chunk = iter.next_arg::<u64>()?;
+        iter.finish()?;
+
+        let adapter_type = self.adapter_type();
+        dbt_adapter_sql::chunking::chunk_predicate(adapter_type, &column, chunks, chunk)
+            .map(Value::from)
+            .ok_or_else(|| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!(
+                        "{adapter_type} has no default chunk hash; override the \
+                         `get_chunk_predicate` macro to use `chunks`"
+                    ),
+                )
+            })
+    }
+
+    /// Replace `relation` with `shadow`. Default for the `swap_relations` macro.
+    ///
+    /// - No existing relation: rename `shadow` to `target`.
+    /// - Existing view: drop it, then rename `shadow` to `target`.
+    /// - Existing table: drop `backup`, rename `target` to `backup`, rename
+    ///   `shadow` to `target` (restoring `backup` to `target` if the second
+    ///   rename fails), and drop `backup`.
+    #[tracing::instrument(skip(self, state), level = "trace")]
+    pub fn swap_relations(&self, state: &State, args: &[Value]) -> Result<Value, minijinja::Error> {
+        match &self.inner {
+            Typed { adapter, .. } => {
+                let iter = ArgsIter::new("swap_relations", &["relation", "shadow", "backup"], args);
+                let target_val = iter.next_arg::<&Value>()?;
+                let target = downcast_value_to_dyn_base_relation(target_val)?;
+                let shadow_val = iter.next_arg::<&Value>()?;
+                let shadow = downcast_value_to_dyn_base_relation(shadow_val)?;
+                let backup_val = iter.next_arg::<&Value>()?;
+                let backup = downcast_value_to_dyn_base_relation(backup_val)?;
+                iter.finish()?;
+
+                Ok(adapter.swap_relations(state, &target, &shadow, &backup)?)
+            }
+            Parse(_) => Ok(none_value()),
+        }
+    }
+
     /// Check if schema exists
     ///
     /// https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L849
@@ -4050,6 +4105,8 @@ impl Adapter {
             "render_raw_columns_constraints" => self.render_raw_columns_constraints(state, args),
             // database: str
             "verify_database" => self.verify_database(state, args),
+            "chunk_predicate" => self.chunk_predicate(state, args),
+            "swap_relations" => self.swap_relations(state, args),
             "commit" => self.commit(),
             // context: dict, strategy: str
             "get_incremental_strategy_macro" => self.get_incremental_strategy_macro(state, args),

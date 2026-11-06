@@ -252,6 +252,41 @@ pub enum ErrorCode {
     /// no longer matched the owner that ran it; a reclaim already overwrote
     /// it, so the write would have clobbered the new owner's own result.
     StateStopRejected = 1414,
+    /// Building the target relation from node metadata failed while checking
+    /// whether a `full_refresh_strategy: swap` model already exists; dbt
+    /// assumes it does not and rebuilds from scratch.
+    SwapTargetRelationCreateFailed = 1415,
+    /// Checking whether the target relation exists before a `swap` rebuild
+    /// failed; dbt skips dropping a pre-existing backup table so a previous
+    /// failed swap is not clobbered.
+    SwapTargetCheckFailed = 1416,
+    /// Dropping the temporary shadow relation after a failed `swap` rebuild
+    /// failed.
+    SwapShadowDropFailed = 1417,
+    /// The shadow relation was preserved after a failed `swap` because the
+    /// target relation was not restored or the backup relation remains.
+    SwapShadowPreserved = 1418,
+    /// A chunked `in_place` rebuild failed after its first chunk replaced the
+    /// relation; dbt dropped the partial relation so the next run rebuilds it
+    /// from scratch instead of updating it incrementally.
+    ChunkedRebuildPartialDropped = 1419,
+    /// A chunked rebuild splits the model's output (`chunk_output_by` or
+    /// `unique_key`) because its SQL has no `get_chunk_filter` predicates:
+    /// every chunk reads all of the model's inputs.
+    ChunkedRebuildFiltersOutput = 1420,
+    /// A data test of a `swap` model does not reference the model by its
+    /// relation name, so it could not run against the shadow before the swap.
+    /// It still runs against the live relation afterwards.
+    SwapPreSwapTestSkipped = 1421,
+    /// A data test failed against the shadow of a `swap` rebuild; the live
+    /// relation was not replaced.
+    SwapPreSwapTestFailed = 1422,
+    /// `verify_chunked_rebuilds` found that a chunked rebuild differs from the
+    /// same model SQL run without its chunk filters.
+    ChunkVerificationFailed = 1423,
+    /// A chunked `in_place` rebuild failed after its first chunk, and dbt could
+    /// not drop the partial relation; it must be rebuilt with `--full-refresh`.
+    ChunkedRebuildPartialDropFailed = 1424,
 
     // Serialization [1450–1460]
     JsonInvalid = 1450,

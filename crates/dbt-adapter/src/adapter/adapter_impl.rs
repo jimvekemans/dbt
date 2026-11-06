@@ -2060,6 +2060,78 @@ impl AdapterImpl {
         }
     }
 
+    /// Replace `target` with `shadow` using `backup` as an intermediate table,
+    /// restoring `backup` to `target` if the second rename fails.
+    pub fn swap_relations(
+        &self,
+        state: &State,
+        target: &Arc<dyn BaseRelation>,
+        shadow: &Arc<dyn BaseRelation>,
+        backup: &Arc<dyn BaseRelation>,
+    ) -> AdapterResult<Value> {
+        let drop_and_uncache = |relation: &Arc<dyn BaseRelation>| -> AdapterResult<()> {
+            self.drop_relation(state, relation)?;
+            let _ = self.cache_dropped(state, relation);
+            Ok(())
+        };
+        let rename_and_cache =
+            |from: &Arc<dyn BaseRelation>, to: &Arc<dyn BaseRelation>| -> AdapterResult<()> {
+                self.rename_relation(state, from, to)?;
+                let _ = self.cache_renamed(state, from, to);
+                Ok(())
+            };
+
+        let existing = execute_macro(
+            state,
+            &[RelationObject::new(Arc::clone(target)).into_value()],
+            "load_cached_relation",
+        )?;
+        if existing.is_none() {
+            rename_and_cache(shadow, target)?;
+            return Ok(none_value());
+        }
+        let existing_rel = crate::cast_util::downcast_value_to_dyn_base_relation(&existing)?;
+        if !existing_rel.is_table() {
+            drop_and_uncache(&existing_rel)?;
+            rename_and_cache(shadow, target)?;
+            return Ok(none_value());
+        }
+
+        drop_and_uncache(backup)?;
+        rename_and_cache(target, backup)?;
+        if let Err(e) = rename_and_cache(shadow, target) {
+            // Second rename failed: restore backup back to target so the live table remains untouched.
+            if let Err(restore_err) = rename_and_cache(backup, target) {
+                dbt_common::tracing::dbt_emit::emit_error_log_message(
+                    ErrorCode::RuntimeError,
+                    format!(
+                        "Failed to restore backup {} back to target {}: {restore_err}",
+                        backup.render_self_as_str(),
+                        target.render_self_as_str()
+                    ),
+                );
+                return Err(AdapterError::new(
+                    AdapterErrorKind::SqlExecution,
+                    format!(
+                        "Failed to swap shadow table {} to target {} ({e}). \
+                         Attempted rollback to restore backup table {} to target {} also failed ({restore_err}). \
+                         Old data remains in backup table '{}' and new data in shadow table '{}'. \
+                         Manual operator intervention required.",
+                        shadow.render_self_as_str(),
+                        target.render_self_as_str(),
+                        backup.render_self_as_str(),
+                        target.render_self_as_str(),
+                        backup.render_self_as_str(),
+                        shadow.render_self_as_str(),
+                    ),
+                ));
+            }
+            return Err(e);
+        }
+        drop_and_uncache(backup)?;
+        Ok(none_value())
+    }
+
     /// BaseAdapter https://github.com/dbt-labs/dbt-adapters/blob/0efd8d3d1081e1ab43e38797d5104f7b424a6284/dbt-adapters/src/dbt/adapters/base/impl.py#L862
     pub fn get_missing_columns(
         &self,
@@ -8593,6 +8665,96 @@ mod tests {
                 .get_relation(to_rel.as_ref())
                 .is_none(),
             "failed rename must not insert to_relation into the relation cache"
+        );
+    }
+
+    #[test]
+    fn swap_relations_double_failure_returns_sql_execution_and_keeps_backup_cached() {
+        let adapter_impl = Arc::new(AdapterImpl::new(engine(Snowflake), None));
+        let make_rel = |name: &str| -> Arc<dyn BaseRelation> {
+            crate::relation::do_create_relation(
+                Snowflake,
+                "D".to_string(),
+                "S".to_string(),
+                Some(name.to_string()),
+                Some(RelationType::Table),
+                SNOWFLAKE_RESOLVED_QUOTING,
+            )
+            .unwrap()
+            .into()
+        };
+        let target_rel = make_rel("TARGET_TBL");
+        let shadow_rel = make_rel("SHADOW_TBL");
+        let backup_rel = make_rel("BACKUP_TBL");
+
+        adapter_impl
+            .engine()
+            .relation_cache()
+            .insert_relation(Arc::clone(&target_rel), None);
+        adapter_impl
+            .engine()
+            .relation_cache()
+            .insert_relation(Arc::clone(&shadow_rel), None);
+
+        // `EngineMode::Mock` (`NoopConnection`) always returns an empty RecordBatch and
+        // cannot fail selected SQL statements, whereas `AdapterImpl::swap_relations`
+        // dispatches `load_cached_relation`, `drop_relation`, and `rename_relation` via
+        // `execute_macro` on `state.env()`. We register those macros and fail any rename
+        // whose destination is `TARGET_TBL` (i.e. both `shadow -> target` and the restore
+        // `backup -> target`, while allowing `target -> backup` to succeed).
+        let mut env = Environment::new();
+        env.add_function(
+            "fail_rename_to_target",
+            |to_ident: String| -> Result<Value, minijinja::Error> {
+                if to_ident == "TARGET_TBL" {
+                    Err(AdapterError::new(
+                        AdapterErrorKind::SqlExecution,
+                        "simulated warehouse rename failure".to_string(),
+                    )
+                    .into())
+                } else {
+                    Ok(Value::from(""))
+                }
+            },
+        );
+        env.add_template(
+            "dbt.load_cached_relation",
+            "{% macro load_cached_relation(rel) %}{{ return(rel) }}{% endmacro %}",
+        )
+        .unwrap();
+        env.add_template(
+            "dbt.drop_relation",
+            "{% macro drop_relation(rel) %}{% endmacro %}",
+        )
+        .unwrap();
+        env.add_template(
+            "dbt.rename_relation",
+            "{% macro rename_relation(from_rel, to_rel) %}{{ fail_rename_to_target(to_rel.identifier) }}{% endmacro %}",
+        )
+        .unwrap();
+        let state = State::new_for_env(&env);
+
+        let err = adapter_impl
+            .swap_relations(&state, &target_rel, &shadow_rel, &backup_rel)
+            .expect_err(
+                "swap_relations must fail when shadow->target and backup->target both fail",
+            );
+        assert_eq!(err.kind(), AdapterErrorKind::SqlExecution);
+        assert!(
+            adapter_impl
+                .engine()
+                .relation_cache()
+                .get_relation(backup_rel.as_ref())
+                .is_some(),
+            "relation cache must still contain backup after restore failure"
+        );
+        assert!(
+            adapter_impl
+                .engine()
+                .relation_cache()
+                .get_relation(target_rel.as_ref())
+                .is_none(),
+            "relation cache must not contain target after restore failure"
         );
     }
 }

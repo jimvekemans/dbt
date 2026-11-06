@@ -49,7 +49,7 @@ pub async fn run_default_render(
     run_blocking_task_operation_with_wait_parents(render_step, wait_parents).await?
 }
 
-fn render_default(
+pub(crate) fn render_default(
     node: &Arc<dyn InternalDbtNodeAttributes>,
     ctx: &mut TaskRunnerCtx,
     local_exec_unit_test_overrides: &Option<UnitTestOverrides>,
