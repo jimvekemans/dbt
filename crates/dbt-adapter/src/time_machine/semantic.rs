@@ -161,7 +161,8 @@ impl SemanticCategory {
             | "table_format"
             | "warn_once"
             | "strip_trailing_statement_terminator"
-            | "chunk_predicate" => SemanticCategory::Pure,
+            | "chunk_predicate"
+            | "row_hash" => SemanticCategory::Pure,
 
             _ => {
                 debug_assert!(

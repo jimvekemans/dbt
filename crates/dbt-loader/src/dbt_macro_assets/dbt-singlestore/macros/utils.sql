@@ -26,6 +26,12 @@
         NULL)
 {% endmacro %}
 
+{# `||` is a logical OR in SingleStore, as in MySQL without the PIPES_AS_CONCAT sql_mode:
+   https://dev.mysql.com/doc/refman/8.4/en/logical-operators.html#operator_or #}
+{% macro singlestore__concat(fields) -%}
+    concat({{ fields|join(', ') }})
+{%- endmacro %}
+
 {% macro singlestore__cast(field, type) %}
     ({{ field }} :> {{ type }})
 {% endmacro %}

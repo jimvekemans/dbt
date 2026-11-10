@@ -94,13 +94,15 @@ pub static LAKECOMPUTE_PROFILE_SETUP: FlagDef = FlagDef {
     docs_url: None,
 };
 
-/// After a chunked rebuild, compare the result with the model SQL run without
-/// its `get_chunk_filter` predicates, and fail the model when they differ. For
-/// CI on small data: the comparison runs the whole unchunked query.
+/// The default `chunk_verification` of chunked rebuilds with chunk filters:
+/// `sampled` when on, `off` when not. A model's own `chunk_verification`
+/// always wins. Verification rebuilds rows under another bucketing and compares
+/// fingerprints, so it never needs more memory than a chunk of the load.
 pub static VERIFY_CHUNKED_REBUILDS: FlagDef = FlagDef {
     name: "verify_chunked_rebuilds",
-    description: "After a chunked rebuild, compare it with the unchunked model SQL and fail \
-                  the model when they differ (before the swap, for swap models).",
+    description: "Verify chunked rebuilds whose model does not set `chunk_verification` \
+                  (as `sampled`): rebuild the first chunk in two smaller chunks and fail \
+                  the model when the rows differ.",
     stage: Stage::Preview,
     default: false,
     remote: Remote::Never,

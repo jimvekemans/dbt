@@ -77,6 +77,54 @@ pub enum FullRefreshStrategy {
 
 impl crate::schemas::project::configs::config_merge::ReplaceIfNone for FullRefreshStrategy {}
 
+/// How a chunked rebuild checks its chunk filters before it is used. See
+/// `docs/full-refresh-swap.md`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, DbtSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkVerification {
+    /// No check.
+    Off,
+    /// After the first chunk, compare it with the same rows built in two
+    /// sub-buckets of twice as many chunks.
+    Sampled,
+    /// After the last chunk, compare the whole result with the model built in
+    /// one chunk more.
+    Full,
+}
+
+impl crate::schemas::project::configs::config_merge::ReplaceIfNone for ChunkVerification {}
+
+/// `chunk_verification`: `off`, `sampled` or `full`, case-insensitively and with
+/// surrounding whitespace (Jinja output), or a boolean, because YAML 1.1 reads a
+/// bare `off` as `false`: `false` is `off`, `true` is `sampled`.
+pub fn chunk_verification_or_bool<'de, D>(
+    deserializer: D,
+) -> Result<Option<ChunkVerification>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = dbt_yaml::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(enabled) = value.as_bool() {
+        return Ok(Some(if enabled {
+            ChunkVerification::Sampled
+        } else {
+            ChunkVerification::Off
+        }));
+    }
+    let text = value.as_str().map(|s| s.trim().to_lowercase());
+    match text.as_deref() {
+        Some("off" | "false" | "no") => Ok(Some(ChunkVerification::Off)),
+        Some("sampled" | "true" | "on" | "yes") => Ok(Some(ChunkVerification::Sampled)),
+        Some("full") => Ok(Some(ChunkVerification::Full)),
+        _ => Err(serde::de::Error::custom(format!(
+            "invalid `chunk_verification` {value:?}: expected `off`, `sampled` or `full`"
+        ))),
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, DbtSchema)]
 pub struct ProjectModelConfig {
     #[serde(rename = "+access")]
@@ -163,6 +211,12 @@ pub struct ProjectModelConfig {
     pub chunks: Option<u64>,
     #[serde(rename = "+chunk_output_by")]
     pub chunk_output_by: Option<String>,
+    #[serde(
+        default,
+        rename = "+chunk_verification",
+        deserialize_with = "chunk_verification_or_bool"
+    )]
+    pub chunk_verification: Option<ChunkVerification>,
     #[serde(rename = "+contract")]
     pub contract: Option<DbtContract>,
     #[serde(rename = "+compression")]
@@ -768,6 +822,7 @@ impl TypedRecursiveConfig for ProjectModelConfig {
             || self.full_refresh_strategy.is_some()
             || self.chunks.is_some()
             || self.chunk_output_by.is_some()
+            || self.chunk_verification.is_some()
             || self.contract.is_some()
             || self.compression.is_some()
             || self.copy_grants.is_some()
@@ -1002,6 +1057,11 @@ pub struct ModelConfig {
     /// Output column to split the model's output on when its SQL has no
     /// `get_chunk_filter` predicates. Defaults to a single-column `unique_key`.
     pub chunk_output_by: Option<String>,
+    /// How a chunked rebuild checks its chunk filters: `off`, `sampled` or
+    /// `full`. Unset: `sampled` with the `verify_chunked_rebuilds` flag, else
+    /// `off`.
+    #[serde(default, deserialize_with = "chunk_verification_or_bool")]
+    pub chunk_verification: Option<ChunkVerification>,
     pub merge_update_columns: Option<StringOrArrayOfStrings>,
     pub merge_exclude_columns: Option<StringOrArrayOfStrings>,
     pub access: Option<Access>,
@@ -1082,6 +1142,7 @@ impl From<ProjectModelConfig> for ModelConfig {
             full_refresh_strategy: config.full_refresh_strategy,
             chunks: config.chunks,
             chunk_output_by: config.chunk_output_by,
+            chunk_verification: config.chunk_verification,
             contract: config.contract,
             database: config.database,
             docs: config.docs,
@@ -1304,6 +1365,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             full_refresh_strategy: config.full_refresh_strategy,
             chunks: config.chunks,
             chunk_output_by: config.chunk_output_by,
+            chunk_verification: config.chunk_verification,
             contract: config.contract,
             database: config.database,
             description: warehouse_specific.description,

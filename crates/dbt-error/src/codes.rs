@@ -302,8 +302,8 @@ pub enum ErrorCode {
     /// A data test failed against the shadow of a `swap` rebuild; the live
     /// relation was not replaced.
     SwapPreSwapTestFailed = 1422,
-    /// `verify_chunked_rebuilds` found that a chunked rebuild differs from the
-    /// same model SQL run without its chunk filters.
+    /// `chunk_verification` found that the rows of a chunked rebuild change when
+    /// they are rebuilt under another bucketing: a chunk filter is wrong.
     ChunkVerificationFailed = 1423,
     /// A chunked `in_place` rebuild failed after its first chunk, and dbt could
     /// not drop the partial relation; it must be rebuilt with `--full-refresh`.

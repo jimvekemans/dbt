@@ -47,13 +47,14 @@ An ordinary incremental run is unchanged: it updates the live relation in place.
 2. Pre-hooks run once, with `{{ this }}` = the live relation.
 3. The first chunk runs through the model's own materialization, pointed at the shadow,
    so contracts, constraints, grants, `persist_docs` and adapter DDL configs (SingleStore
-   `shard_key`, Snowflake `cluster_by`, ...) all apply.
+   `shard_key`, Snowflake `cluster_by`, ...) all apply. With
+   [`chunk_verification: sampled`](#verifying-chunk-filters), it is verified right away.
 4. The other chunks are inserted into the shadow, with the column list read from it.
    Microbatch models run their batches against the shadow instead. Nobody reads the
    shadow, so each chunk commits on its own. Every chunk logs `Loading chunk k/N of
    <relation> (into <shadow>)` (`Loading chunk k/N of <relation>` for in-place builds).
-5. With [`verify_chunked_rebuilds`](#verifying-chunk-filters-in-ci) on, the shadow is
-   compared with the unchunked model SQL.
+5. With [`chunk_verification: full`](#verifying-chunk-filters), the whole shadow is
+   verified.
 6. When the invocation selected the model's data tests (`dbt build`), they run against the
    shadow; see [Testing before the swap](#testing-before-the-swap).
 7. The shadow is swapped in and the old data dropped. On SingleStore, which keys
@@ -125,8 +126,8 @@ Outside a chunked rebuild (`chunks` unset or 1, or an incremental run) they rend
   key *in that input*: the column in the join condition, which may be named differently in
   each input (`hub_vacature_hkey` in one, `vacature_uuid_hkey` in the other). Rows that are
   joined together then share a chunk. Inputs without a filter are read in full by every
-  chunk. A wrong column does not fail the run: joins silently miss rows. Run CI with
-  [`verify_chunked_rebuilds`](#verifying-chunk-filters-in-ci) to catch it.
+  chunk. A wrong column does not fail the run: joins silently miss rows. Turn on
+  [`chunk_verification`](#verifying-chunk-filters) to catch it.
 - A model that aggregates or uses window functions must filter on its group or partition
   key, or a part of it.
 - The column may be an expression, such as `concat_ws('|', a, b)` for a composite key; prefer
@@ -162,20 +163,69 @@ model's relation by name cannot be redirected, and a test that also reads a down
 the run that has not finished yet would compare against stale data; both are skipped before the
 swap (`dbt1421`) and run after it.
 
-### Verifying chunk filters in CI
+### Verifying chunk filters
 
-A wrong chunk filter produces wrong data without failing. With the preview flag
-`verify_chunked_rebuilds` on, dbt compares every chunked rebuild that uses chunk filters with
-the same model SQL run without them, before the swap (or after the last chunk, in place), and
-fails the model on any difference (`dbt1423`), naming the counts:
+A wrong chunk filter produces wrong data without failing. `chunk_verification` makes dbt
+check the filters while it rebuilds: with correct filters the result does not depend on how
+the model is chunked, so dbt builds some of its rows again under a different bucketing and
+compares the two. It compares fingerprints (the row count and the sum of a hash of every
+row), not rows, and never runs the model without its chunk filters, so no verification
+statement needs more memory than a chunk of the load. A difference fails the model with
+`dbt1423`, before the swap: the live relation is kept (in place, the partial relation is
+dropped, as for any failed chunk).
 
-```bash
-DBT_ENGINE_FEATURES=verify_chunked_rebuilds dbt build --select tag:chunked --full-refresh
+| `chunk_verification` | When | What is compared | Extra work |
+|---|---|---|---|
+| `sampled` | right after the first chunk loads | that chunk vs. the same rows built as chunks 1 and N+1 of 2N | two half chunks |
+| `full` | after the last chunk | the whole result vs. the model built in N+1 chunks | N+1 chunks, each smaller than a chunk of the load |
+| `off` | never | | none |
+
+Set it per model, per folder (`+chunk_verification`) or per target:
+
+```yaml
+# dbt_project.yml
+models:
+  my_project:
+    marts:
+      +chunk_verification: "{{ 'sampled' if target.name == 'ci' else 'off' }}"
+
+# a model's YAML
+models:
+  - name: fct_orders
+    config:
+      full_refresh_strategy: swap
+      chunks: 8
+      chunk_verification: full
 ```
 
-The comparison runs the whole unchunked query, so turn it on in CI or dev on small data,
-never in production. It needs deterministic output: a column filled by `current_timestamp()`
-differs between the chunks and the comparison, so take such values from `run_started_at`.
+When a model does not set it, the preview flag `verify_chunked_rebuilds` makes it `sampled`
+(`DBT_ENGINE_FEATURES=verify_chunked_rebuilds dbt build ...`); without the flag it is `off`.
+A bare `off` in YAML reads as `false`, which also means `off` (`true` means `sampled`). On a
+model without chunks or without chunk filters it has no effect (splitting the output is
+correct by construction), so it is safe to set on a whole folder.
+
+What it catches. A misaligned filter shows up as rows that belong together landing in
+different chunks:
+
+- `sampled` catches a filter on the wrong column almost surely, and fails after the first
+  chunk instead of after the whole load. It always checks the first chunk, so repeated runs
+  cover the same keys: isolated mismatches between keys need `full`.
+- `full` checks every row, and catches each misaligned pair of rows with probability
+  (2N-1)/(N(N+1)), about 21% at N=8, so any systematic error.
+- Both need deterministic output (no `current_timestamp()`, `random()`, or ties in a
+  window's `order by`; take timestamps from `run_started_at`) and inputs that do not change
+  during the rebuild.
+- `sampled` needs a custom `get_chunk_predicate` to nest: chunk k of N must be chunks k
+  and k+N of 2N, as with any `expression % chunks`. Use `full` otherwise.
+- `full` builds chunks of N+1. With heavily skewed keys one of them can be larger than every
+  chunk of the load; a verification statement that fails says so.
+- Values are hashed as the model SQL returns them and as the relation stores them. The first
+  chunk creates the relation from the same SQL, so they agree, unless a contract declares a
+  column with less precision than the SQL produces (`datetime` for a `datetime(6)` value):
+  declare the type the SQL returns, or cast it in the SQL.
+
+The row hash comes from the dispatched `get_rows_fingerprint(sql, columns)` macro (see
+[Overriding the SQL](#overriding-the-sql)).
 
 Each adapter ships a default hash expression, except Salesforce, Exasol, Datafusion,
 Dremio, Oracle and LakeCompute: override `get_chunk_predicate` to use `chunks` there.
@@ -193,12 +243,13 @@ A live view (say the model used to be a view) is dropped, and the shadow renamed
 
 ## Overriding the SQL
 
-dbt runs the rebuild. The two pieces of SQL that differ per warehouse or project are
+dbt runs the rebuild. The pieces of SQL that differ per warehouse or project are
 dispatched macros in the `dbt` namespace:
 
 | Macro | Returns |
 |---|---|
 | `get_chunk_predicate(column, chunks, chunk)` | a SQL boolean selecting chunk `chunk` (0-based) |
+| `get_rows_fingerprint(sql, columns)` | a query returning `(row_count, row_hash_sum)` for the rows of `sql` |
 | `swap_relations(relation, shadow, backup)` | nothing; performs the swap |
 
 Override them like any dispatched macro: a macro in your project named

@@ -1717,6 +1717,29 @@ impl Adapter {
             })
     }
 
+    /// A non-negative 32-bit integer hash of the SQL expression `expr`, for the
+    /// row fingerprints of `get_rows_fingerprint`, which verify chunked
+    /// rebuilds.
+    #[tracing::instrument(skip(self, _state), level = "trace")]
+    pub fn row_hash(&self, _state: &State, args: &[Value]) -> Result<Value, minijinja::Error> {
+        let iter = ArgsIter::new("row_hash", &["expr"], args);
+        let expr = iter.next_arg::<String>()?;
+        iter.finish()?;
+
+        let adapter_type = self.adapter_type();
+        dbt_adapter_sql::chunking::row_hash_expr(adapter_type, &expr)
+            .map(Value::from)
+            .ok_or_else(|| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!(
+                        "{adapter_type} has no default row hash; override the \
+                         `get_rows_fingerprint` macro or set `chunk_verification: off`"
+                    ),
+                )
+            })
+    }
+
     /// Replace `relation` with `shadow`. Default for the `swap_relations` macro.
     ///
     /// - No existing relation: rename `shadow` to `target`.
@@ -4149,6 +4172,7 @@ impl Adapter {
             // database: str
             "verify_database" => self.verify_database(state, args),
             "chunk_predicate" => self.chunk_predicate(state, args),
+            "row_hash" => self.row_hash(state, args),
             "swap_relations" => self.swap_relations(state, args),
             "commit" => self.commit(state),
             // context: dict, strategy: str

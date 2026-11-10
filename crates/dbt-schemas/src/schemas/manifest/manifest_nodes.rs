@@ -25,7 +25,9 @@ use crate::schemas::dbt_column::Granularity;
 use crate::schemas::project::configs::common::{
     LazyWarehouseSpecificNodeConfig, WarehouseSpecificNodeConfig,
 };
-use crate::schemas::project::configs::model_config::{FullRefreshStrategy, LatestVersionPointer};
+use crate::schemas::project::configs::model_config::{
+    ChunkVerification, FullRefreshStrategy, LatestVersionPointer,
+};
 use crate::schemas::properties::{ModelFreshness, ModelState};
 
 use crate::schemas::serde::{bool_or_string_bool, string_or_number_to_string};
@@ -977,6 +979,12 @@ pub struct ManifestModelConfig {
     pub chunks: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_output_by: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::schemas::project::configs::model_config::chunk_verification_or_bool"
+    )]
+    pub chunk_verification: Option<ChunkVerification>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merge_update_columns: Option<StringOrArrayOfStrings>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1240,6 +1248,7 @@ impl From<ModelConfig> for ManifestModelConfig {
             full_refresh_strategy: config.full_refresh_strategy,
             chunks: config.chunks,
             chunk_output_by: config.chunk_output_by.clone(),
+            chunk_verification: config.chunk_verification,
             merge_update_columns: config.merge_update_columns,
             merge_exclude_columns: config.merge_exclude_columns,
             access: config.access,
@@ -1327,6 +1336,7 @@ impl From<ManifestModelConfig> for ModelConfig {
             full_refresh_strategy: config.full_refresh_strategy,
             chunks: config.chunks,
             chunk_output_by: config.chunk_output_by.clone(),
+            chunk_verification: config.chunk_verification,
             merge_update_columns: config.merge_update_columns,
             merge_exclude_columns: config.merge_exclude_columns,
             access: config.access,

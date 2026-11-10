@@ -201,8 +201,8 @@ pub mod schemas {
             MetricConfig, ProjectMetricConfigs, ResolvedMetricConfig,
         };
         pub use configs::model_config::{
-            FullRefreshStrategy, LatestVersionPointer, ModelConfig, ProjectModelConfig,
-            ResolvedModelConfig,
+            ChunkVerification, FullRefreshStrategy, LatestVersionPointer, ModelConfig,
+            ProjectModelConfig, ResolvedModelConfig,
         };
         pub use configs::saved_query_config::{
             ExportConfigExportAs, ResolvedSavedQueryConfig, SavedQueryCache, SavedQueryConfig,

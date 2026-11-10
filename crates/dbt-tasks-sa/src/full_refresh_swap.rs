@@ -27,6 +27,7 @@ use dbt_jinja_utils::phases::run::build_run_node_context;
 use dbt_schemas::materialization_resolver::MaterializationResolver;
 use dbt_schemas::schemas::common::DbtMaterialization;
 pub use dbt_schemas::schemas::full_refresh_swap::{SwapPlan, in_place_chunk_plan, swap_plan};
+use dbt_schemas::schemas::project::ChunkVerification;
 #[cfg(test)]
 use dbt_schemas::schemas::project::FullRefreshStrategy;
 use dbt_schemas::schemas::{DbtModel, InternalDbtNode, InternalDbtNodeAttributes, NodePathKind};
@@ -214,7 +215,8 @@ impl ShadowBuild {
     /// goes through the model's own materialization, so every adapter-specific
     /// DDL option, contract and `persist_docs` (and grants, where they survive
     /// the rename) applies to the shadow; the remaining chunks are inserted
-    /// into it.
+    /// into it. `chunk_verification` checks the first chunk (`sampled`) or the
+    /// whole shadow (`full`).
     pub fn load(
         &self,
         sql: &str,
@@ -225,11 +227,7 @@ impl ShadowBuild {
         let sql = sql.trim().trim_end_matches(';');
         // Chunk inserts run outside the materialization, so they prepend the
         // model's `sql_header` themselves.
-        let header = sql_header
-            .as_ref()
-            .filter(|header| !header.is_none())
-            .map(|header| format!("{header}\n"))
-            .unwrap_or_default();
+        let header = header_prefix(sql_header.as_ref());
         report_chunk(0, plan.chunks, &self.context, SHADOW);
         let (_, response) = materialize_model(
             &chunk_sql(&self.context, &self.run_path, sql, plan, 0, &env.jinja_env)?,
@@ -243,6 +241,17 @@ impl ShadowBuild {
             sql_header,
         )
         .map_err(|e| self.relabel(e, env))?;
+        let mut verifier = Verifier::new(
+            &self.context,
+            &self.run_path,
+            SHADOW,
+            sql,
+            plan,
+            &header,
+            &env.jinja_env,
+            &self.shadow_model.__common_attr__.unique_id,
+        );
+        verifier.after_first_chunk()?;
         insert_remaining_chunks(
             &self.context,
             &self.run_path,
@@ -252,6 +261,7 @@ impl ShadowBuild {
             &header,
             &env.jinja_env,
         )?;
+        verifier.after_last_chunk()?;
         Ok(response)
     }
 
@@ -260,26 +270,6 @@ impl ShadowBuild {
         (
             var(&self.context, TARGET).to_string(),
             var(&self.context, SHADOW).to_string(),
-        )
-    }
-
-    /// Compare the loaded shadow with the unchunked model SQL when
-    /// `verify_chunked_rebuilds` is on.
-    pub fn verify(
-        &self,
-        sql: &str,
-        plan: &SwapPlan,
-        model: &DbtModel,
-        env: &SwapEnv<'_>,
-    ) -> FsResult<()> {
-        verify_chunks(
-            &self.context,
-            &self.run_path,
-            SHADOW,
-            sql.trim().trim_end_matches(';'),
-            plan,
-            &env.jinja_env,
-            &model.__common_attr__.unique_id,
         )
     }
 
@@ -474,27 +464,28 @@ fn chunk_filter(predicate: &str, column: &str) -> String {
     format!("{predicate}{CHUNK_FILTER_TAG_OPEN}{column}{CHUNK_FILTER_TAG_CLOSE}")
 }
 
-/// What `rewrite_chunk_filters` turns the chunk-0 predicates into.
-#[derive(Debug, Clone, Copy)]
-enum ChunkTarget {
-    /// The predicates of this chunk.
-    Chunk(u64),
-    /// No filtering: the whole model, to verify a chunked rebuild against.
-    All,
+/// One hash bucket: `chunk` (0-based) of `chunks`. The load uses the plan's
+/// chunks; verification rebuilds rows under other bucketings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bucket {
+    chunks: u64,
+    chunk: u64,
 }
 
-/// `sql` with every chunk-0 `get_chunk_filter` predicate replaced as `target`
-/// says. `predicate(column, chunk)` renders `get_chunk_predicate`; every tag must
-/// carry its chunk-0 predicate, so hand-written filters are rejected.
+/// `sql` with every chunk-0 `get_chunk_filter` predicate of a model chunked in
+/// `chunks` replaced by the predicate of `target`. `predicate(column, chunks,
+/// chunk)` renders `get_chunk_predicate`; every tag must carry its chunk-0
+/// predicate, so hand-written filters are rejected.
 fn rewrite_chunk_filters(
     sql: &str,
-    target: ChunkTarget,
-    mut predicate: impl FnMut(&str, u64) -> FsResult<String>,
+    chunks: u64,
+    target: Bucket,
+    mut predicate: impl FnMut(&str, u64, u64) -> FsResult<String>,
 ) -> FsResult<String> {
     let mut rewritten = sql.to_string();
     for column in chunk_filter_columns(sql) {
         let tag = format!("{CHUNK_FILTER_TAG_OPEN}{column}{CHUNK_FILTER_TAG_CLOSE}");
-        let first = chunk_filter(&format!("{} ", predicate(column, 0)?), column);
+        let first = chunk_filter(&format!("{} ", predicate(column, chunks, 0)?), column);
         let tags = sql.matches(&tag).count();
         let filters = sql.matches(&first).count();
         if filters != tags {
@@ -505,11 +496,10 @@ fn rewrite_chunk_filters(
                 first.trim_end_matches(&tag).trim_end(),
             ));
         }
-        let replacement = match target {
-            ChunkTarget::Chunk(0) => continue,
-            ChunkTarget::Chunk(chunk) => predicate(column, chunk)?,
-            ChunkTarget::All => "(1 = 1)".to_string(),
-        };
+        if target == (Bucket { chunks, chunk: 0 }) {
+            continue;
+        }
+        let replacement = predicate(column, target.chunks, target.chunk)?;
         rewritten = rewritten.replace(&first, &chunk_filter(&format!("{replacement} "), column));
     }
     Ok(rewritten)
@@ -549,11 +539,12 @@ fn chunk_sql(
     if plan.chunks == 1 {
         return Ok(sql.to_string());
     }
-    let predicate = |column: &str, chunk: u64| {
-        chunk_predicate(context, run_path, jinja_env, plan.chunks, column, chunk)
+    let target = Bucket {
+        chunks: plan.chunks,
+        chunk,
     };
     if !chunk_filter_columns(sql).is_empty() {
-        return rewrite_chunk_filters(sql, ChunkTarget::Chunk(chunk), predicate);
+        return bucket_sql(context, run_path, sql, plan, target, jinja_env);
     }
     let Some(column) = &plan.chunk_output_by else {
         return Err(fs_err!(
@@ -562,10 +553,25 @@ fn chunk_sql(
             plan.chunks
         ));
     };
-    let predicate = predicate(column, chunk)?;
+    let predicate = chunk_predicate(context, run_path, jinja_env, plan.chunks, column, chunk)?;
     Ok(format!(
         "select * from (\n{sql}\n) as dbt_chunk_source\nwhere {predicate}"
     ))
+}
+
+/// The model SQL, whose chunk filters were rendered for `plan.chunks`, with
+/// those filters selecting `target` instead.
+fn bucket_sql(
+    context: &OverlayMap,
+    run_path: &Path,
+    sql: &str,
+    plan: &SwapPlan,
+    target: Bucket,
+    jinja_env: &JinjaEnv,
+) -> FsResult<String> {
+    rewrite_chunk_filters(sql, plan.chunks, target, |column, chunks, chunk| {
+        chunk_predicate(context, run_path, jinja_env, chunks, column, chunk)
+    })
 }
 
 /// Warn when a chunked model falls back to splitting its output on its
@@ -583,7 +589,7 @@ fn warn_if_output_filtered(model: &DbtModel, sql: &str, plan: &SwapPlan) {
         emit_warn_log_message(
             ErrorCode::ChunkedRebuildFiltersOutput,
             format!(
-                "{} is rebuilt in {} chunks by splitting its output on `{column}`, so every chunk reads all of its inputs. Filter the inputs instead with `get_chunk_filter` (`chunk_by` in `import_dependencies`), or set `chunk_output_by: {column}` to keep this.",
+                "{} is rebuilt in {} chunks by splitting its output on `{column}`, so every chunk reads all of its inputs. Filter the inputs instead with `chunk_where`, `chunk_and` or `get_chunk_filter`, or set `chunk_output_by: {column}` to keep this.",
                 &model.__common_attr__.unique_id, plan.chunks
             ),
         );
@@ -605,78 +611,303 @@ fn report_chunk(chunk: u64, chunks: u64, context: &OverlayMap, relation_var: &st
     }
 }
 
-/// With `verify_chunked_rebuilds` on, compare the relation bound to
-/// `relation_var` with the model SQL run without its chunk filters, and fail
-/// when they differ. Only models with `get_chunk_filter` predicates are
-/// checked: splitting the output is correct by construction.
-fn verify_chunks(
-    context: &OverlayMap,
-    run_path: &Path,
-    relation_var: &str,
-    sql: &str,
-    plan: &SwapPlan,
-    jinja_env: &JinjaEnv,
-    unique_id: &str,
-) -> FsResult<()> {
-    if plan.chunks == 1
-        || chunk_filter_columns(sql).is_empty()
-        || !dbt_flags::VERIFY_CHUNKED_REBUILDS.enabled()
+/// How this rebuild checks its chunk filters: the model's `chunk_verification`,
+/// or `sampled` with the `verify_chunked_rebuilds` flag when it is unset.
+/// Unchunked models and models without chunk filters are never checked:
+/// splitting the output is correct by construction.
+fn verification_mode(plan: &SwapPlan, sql: &str, unique_id: &str) -> ChunkVerification {
+    let configured = plan.verification.unwrap_or_else(|| {
+        if dbt_flags::VERIFY_CHUNKED_REBUILDS.enabled() {
+            ChunkVerification::Sampled
+        } else {
+            ChunkVerification::Off
+        }
+    });
+    if configured != ChunkVerification::Off
+        && (plan.chunks == 1 || chunk_filter_columns(sql).is_empty())
     {
-        return Ok(());
-    }
-    let unchunked = rewrite_chunk_filters(sql, ChunkTarget::All, |column, chunk| {
-        chunk_predicate(context, run_path, jinja_env, plan.chunks, column, chunk)
-    })?;
-    let relation = var(context, relation_var).to_string();
-    let query = format!(
-        "select chunked.n as chunked_rows, unchunked.n as unchunked_rows, only_chunked.n as only_chunked_rows, only_unchunked.n as only_unchunked_rows from
-(select count(*) as n from {relation}) as chunked,
-(select count(*) as n from (\n{unchunked}\n) as dbt_unchunked) as unchunked,
-(select count(*) as n from (select * from {relation} except select * from (\n{unchunked}\n) as dbt_unchunked) as d) as only_chunked,
-(select count(*) as n from (select * from (\n{unchunked}\n) as dbt_unchunked except select * from {relation}) as d) as only_unchunked"
-    );
-    let mut context = context.clone();
-    context.insert("__dbt_swap_sql".to_string(), Value::from(query));
-    let row = eval(
-        jinja_env,
-        &context,
-        run_path,
-        "run_query(__dbt_swap_sql).rows[0]",
-    )?;
-    let counts = row
-        .try_iter()
-        .map_err(|e| {
-            fs_err!(
-                ErrorCode::MacroUnsupportedValueType,
-                "Cannot read the chunk verification result: {e}"
-            )
-        })?
-        .map(|value| value.to_string().parse::<u64>().unwrap_or(u64::MAX))
-        .collect::<Vec<_>>();
-    let [chunked, unchunked, only_chunked, only_unchunked] = counts[..] else {
-        return Err(fs_err!(
-            ErrorCode::MacroUnsupportedValueType,
-            "Unexpected chunk verification result: {counts:?}"
+        emit_debug_log_message(format!(
+            "Not verifying {unique_id}: it is not rebuilt in chunks with chunk filters"
         ));
-    };
-    if chunked != unchunked || only_chunked != 0 || only_unchunked != 0 {
-        return Err(fs_err!(
-            ErrorCode::ChunkVerificationFailed,
-            "The chunked rebuild of {unique_id} differs from its SQL without chunk filters: {chunked} rows chunked, {unchunked} unchunked; {only_chunked} distinct rows only in the chunked result, {only_unchunked} only in the unchunked one. Check that every `chunk_by` / `get_chunk_filter` names the column that holds the same key in its input (the column in the join), that grouping and window keys match it, and that the output is deterministic (no current_timestamp() or random())."
+        return ChunkVerification::Off;
+    }
+    if plan.verification == Some(ChunkVerification::Off)
+        && dbt_flags::VERIFY_CHUNKED_REBUILDS.enabled()
+    {
+        emit_debug_log_message(format!(
+            "Not verifying {unique_id}: its `chunk_verification` is `off`"
         ));
     }
-    if relation_var == TARGET {
-        emit_info_log_message(format!(
-            "Verified {relation}: {chunked} rows, the same as without chunk filters"
-        ));
-    } else {
-        let target = var(&context, TARGET);
-        emit_info_log_message(format!(
-            "Verified {target} (in {relation}): {chunked} rows, the same as without chunk filters"
-        ));
-    }
-    Ok(())
+    configured
 }
+
+/// The rows of a query, described independently of their order: how many
+/// there are and the sum of their hashes (`get_rows_fingerprint`). The
+/// fingerprints of disjoint sets of rows add up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Fingerprint {
+    rows: i128,
+    hash_sum: i128,
+}
+
+impl std::ops::Add for Fingerprint {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            rows: self.rows + other.rows,
+            hash_sum: self.hash_sum + other.hash_sum,
+        }
+    }
+}
+
+impl std::iter::Sum for Fingerprint {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |total, part| total + part)
+    }
+}
+
+impl std::fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} rows, hash sum {}", self.rows, self.hash_sum)
+    }
+}
+
+/// An integer from a query result. Decimal types may render a zero fraction
+/// (`12.000000`); anything else, NULL included, is `None`.
+fn parse_integer(text: &str) -> Option<i128> {
+    let text = text.trim();
+    let (integer, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if !fraction.chars().all(|c| c == '0') {
+        return None;
+    }
+    integer.parse().ok()
+}
+
+/// The checks of a chunked rebuild, against the relation it loads into.
+struct Verifier<'a> {
+    context: OverlayMap,
+    run_path: &'a Path,
+    relation_var: &'a str,
+    sql: &'a str,
+    plan: &'a SwapPlan,
+    header: &'a str,
+    jinja_env: &'a JinjaEnv,
+    unique_id: &'a str,
+    /// Whether `header` (the model's `sql_header`) ran on this connection.
+    header_applied: bool,
+}
+
+impl<'a> Verifier<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        context: &OverlayMap,
+        run_path: &'a Path,
+        relation_var: &'a str,
+        sql: &'a str,
+        plan: &'a SwapPlan,
+        header: &'a str,
+        jinja_env: &'a JinjaEnv,
+        unique_id: &'a str,
+    ) -> Self {
+        Self {
+            context: context.clone(),
+            run_path,
+            relation_var,
+            sql,
+            plan,
+            header,
+            jinja_env,
+            unique_id,
+            header_applied: false,
+        }
+    }
+
+    /// After chunk 0 is loaded, with `sampled`: the relation holds exactly
+    /// chunk 0 of N, which is chunks 0 and N of 2N. Rebuild those two
+    /// (half a chunk each) and compare.
+    fn after_first_chunk(&mut self) -> FsResult<()> {
+        if verification_mode(self.plan, self.sql, self.unique_id) != ChunkVerification::Sampled {
+            return Ok(());
+        }
+        let chunks = self.plan.chunks;
+        emit_info_log_message(format!(
+            "Verifying chunk 1/{chunks} of {}: rebuilding it as chunks 1 and {} of {}",
+            self.place(),
+            chunks + 1,
+            2 * chunks
+        ));
+        let rebuilt = [0, chunks]
+            .into_iter()
+            .map(|chunk| {
+                self.bucket(Bucket {
+                    chunks: 2 * chunks,
+                    chunk,
+                })
+            })
+            .sum::<FsResult<Fingerprint>>()?;
+        self.compare(
+            &format!("chunk 1/{chunks}"),
+            2 * chunks,
+            ChunkVerification::Sampled,
+            rebuilt,
+        )
+    }
+
+    /// After the last chunk, with `full`: rebuild the whole model in N+1
+    /// chunks, each smaller than a chunk of the load, and compare.
+    fn after_last_chunk(&mut self) -> FsResult<()> {
+        if verification_mode(self.plan, self.sql, self.unique_id) != ChunkVerification::Full {
+            return Ok(());
+        }
+        let chunks = self.plan.chunks + 1;
+        emit_info_log_message(format!(
+            "Verifying {}: rebuilding it in {chunks} chunks",
+            self.place()
+        ));
+        let mut rebuilt = Fingerprint::default();
+        for chunk in 0..chunks {
+            emit_debug_log_message(format!(
+                "Verifying chunk {}/{chunks} of {}",
+                chunk + 1,
+                var(&self.context, TARGET)
+            ));
+            rebuilt = rebuilt + self.bucket(Bucket { chunks, chunk })?;
+        }
+        self.compare("all chunks", chunks, ChunkVerification::Full, rebuilt)
+    }
+
+    /// Fail unless the relation's rows match `rebuilt`, the same rows built in
+    /// `chunks` chunks.
+    fn compare(
+        &mut self,
+        what: &str,
+        chunks: u64,
+        mode: ChunkVerification,
+        rebuilt: Fingerprint,
+    ) -> FsResult<()> {
+        let relation = var(&self.context, self.relation_var).to_string();
+        let loaded = self.fingerprint(&format!("select * from {relation}"))?;
+        if loaded != rebuilt {
+            let nesting = if mode == ChunkVerification::Sampled {
+                " A custom `get_chunk_predicate` must also nest (chunk k of N = chunks k and k+N of 2N) for `chunk_verification: sampled`; use `full` otherwise."
+            } else {
+                ""
+            };
+            return Err(fs_err!(
+                ErrorCode::ChunkVerificationFailed,
+                "The chunked rebuild of {} depends on how it is chunked: {what} of {} loaded in {} chunks has {loaded}, the same rows rebuilt in {chunks} chunks have {rebuilt}. Check that every chunk filter (`chunk_where`, `chunk_and`, `get_chunk_filter`) names the column that holds the same key in its input (the column in the join), that grouping and window keys match it, that the output is deterministic (no current_timestamp(), random() or ties in a window's order by), and that no input changed during the rebuild.{nesting}",
+                self.unique_id,
+                var(&self.context, TARGET),
+                self.plan.chunks,
+            ));
+        }
+        emit_info_log_message(format!(
+            "Verified {what} of {}: {loaded}, the same in {chunks} chunks",
+            self.place()
+        ));
+        Ok(())
+    }
+
+    /// The fingerprint of the model SQL restricted to `bucket`.
+    fn bucket(&mut self, bucket: Bucket) -> FsResult<Fingerprint> {
+        let sql = bucket_sql(
+            &self.context,
+            self.run_path,
+            self.sql,
+            self.plan,
+            bucket,
+            self.jinja_env,
+        )?;
+        let other_modes = if bucket.chunks == 2 * self.plan.chunks {
+            "`off`"
+        } else {
+            "`sampled` or `off`"
+        };
+        self.fingerprint(&sql).map_err(|mut error| {
+            error.context = format!(
+                "{} (while verifying {} with `chunk_verification`: chunk {} of {} did not run; with heavy key skew a verification chunk can need more than a chunk of the load, so consider `chunk_verification: {other_modes}` for this model)",
+                error.context,
+                self.unique_id,
+                bucket.chunk + 1,
+                bucket.chunks
+            );
+            error
+        })
+    }
+
+    /// Run `get_rows_fingerprint` over `sql`, with the relation's columns.
+    fn fingerprint(&mut self, sql: &str) -> FsResult<Fingerprint> {
+        // Session settings in `sql_header` (optimizer switches, ...) apply to the
+        // verification queries as to the load. They run as their own statement:
+        // the fingerprint query's result must be the only one fetched.
+        if !self.header_applied && !self.header.trim().is_empty() {
+            execute(self.jinja_env, &self.context, self.run_path, self.header)?;
+            self.header_applied = true;
+        }
+        if !self.context.contains_key(COLUMNS) {
+            let columns = eval(
+                self.jinja_env,
+                &self.context,
+                self.run_path,
+                &format!("adapter.get_columns_in_relation({})", self.relation_var),
+            )?;
+            self.context.insert(COLUMNS.to_string(), columns);
+        }
+        let mut context = self.context.clone();
+        context.insert("__dbt_swap_sql".to_string(), Value::from(sql));
+        let query = eval(
+            self.jinja_env,
+            &context,
+            self.run_path,
+            &format!("get_rows_fingerprint(__dbt_swap_sql, {COLUMNS})"),
+        )?;
+        context.insert("__dbt_swap_sql".to_string(), query);
+        let row = eval(
+            self.jinja_env,
+            &context,
+            self.run_path,
+            "run_query(__dbt_swap_sql).rows[0]",
+        )?;
+        let values = row
+            .try_iter()
+            .map_err(|e| {
+                fs_err!(
+                    ErrorCode::MacroUnsupportedValueType,
+                    "Cannot read the fingerprint of {}: {e}",
+                    var(&self.context, TARGET)
+                )
+            })?
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        if let [rows, hash_sum] = values.as_slice()
+            && let (Some(rows), Some(hash_sum)) = (parse_integer(rows), parse_integer(hash_sum))
+        {
+            return Ok(Fingerprint { rows, hash_sum });
+        }
+        Err(fs_err!(
+            ErrorCode::MacroUnsupportedValueType,
+            "`get_rows_fingerprint` must return two integers (row count, hash sum), got {values:?}"
+        ))
+    }
+
+    /// The relation being verified, for messages: the target, and the shadow
+    /// when it is not loaded in place.
+    fn place(&self) -> String {
+        if self.relation_var == TARGET {
+            var(&self.context, TARGET).to_string()
+        } else {
+            format!(
+                "{} (in {})",
+                var(&self.context, TARGET),
+                var(&self.context, self.relation_var)
+            )
+        }
+    }
+}
+
+/// Context key of the loaded relation's columns, read once per verification.
+const COLUMNS: &str = "__dbt_swap_columns";
 
 /// `sql` with every whole occurrence of the relation `from` replaced by `to`,
 /// and how many there were. An occurrence that continues an identifier on
@@ -750,6 +981,15 @@ fn insert_remaining_chunks(
     Ok(())
 }
 
+/// The model's `sql_header`, to prepend to statements that run outside its
+/// materialization (chunk inserts, verification queries).
+fn header_prefix(sql_header: Option<&Value>) -> String {
+    sql_header
+        .filter(|header| !header.is_none())
+        .map(|header| format!("{header}\n"))
+        .unwrap_or_default()
+}
+
 fn execute(jinja_env: &JinjaEnv, context: &OverlayMap, run_path: &Path, sql: &str) -> FsResult<()> {
     let mut context = context.clone();
     context.insert("__dbt_swap_sql".to_string(), Value::from(sql));
@@ -779,8 +1019,8 @@ fn eval(
 }
 
 /// Rebuild a non-microbatch `swap` model: shadow, chunks, swap. `before_swap`
-/// runs once the shadow is complete (and verified, with
-/// `verify_chunked_rebuilds`); an error from it keeps the live relation.
+/// runs once the shadow is complete (and verified, with `chunk_verification`);
+/// an error from it keeps the live relation.
 pub fn materialize_model_swap(
     sql: &str,
     model: &DbtModel,
@@ -794,7 +1034,6 @@ pub fn materialize_model_swap(
     let response = build
         .load(sql, plan, sql_header, env)
         .and_then(|response| {
-            build.verify(sql, plan, model, env)?;
             before_swap(&build)?;
             Ok(response)
         })
@@ -819,11 +1058,7 @@ pub fn materialize_model_chunked_in_place(
     env: &SwapEnv<'_>,
 ) -> FsResult<(Value, Option<AdapterResponse>)> {
     let sql = sql.trim().trim_end_matches(';');
-    let header = sql_header
-        .as_ref()
-        .filter(|header| !header.is_none())
-        .map(|header| format!("{header}\n"))
-        .unwrap_or_default();
+    let header = header_prefix(sql_header.as_ref());
     let (mut context, _result_store) = build_run_node_context(
         model,
         &model.deprecated_config,
@@ -866,7 +1101,7 @@ pub fn materialize_model_chunked_in_place(
         env.io_args,
         sql_header,
     )?;
-    let loaded = insert_remaining_chunks(
+    let mut verifier = Verifier::new(
         &context,
         &run_path,
         TARGET,
@@ -874,18 +1109,22 @@ pub fn materialize_model_chunked_in_place(
         plan,
         &header,
         &env.jinja_env,
-    )
-    .and_then(|_| {
-        verify_chunks(
-            &context,
-            &run_path,
-            TARGET,
-            sql,
-            plan,
-            &env.jinja_env,
-            &model.__common_attr__.unique_id,
-        )
-    });
+        &model.__common_attr__.unique_id,
+    );
+    let loaded = verifier
+        .after_first_chunk()
+        .and_then(|_| {
+            insert_remaining_chunks(
+                &context,
+                &run_path,
+                TARGET,
+                sql,
+                plan,
+                &header,
+                &env.jinja_env,
+            )
+        })
+        .and_then(|_| verifier.after_last_chunk());
     if let Err(error) = loaded {
         let target = var(&context, TARGET);
         match eval(
@@ -917,12 +1156,16 @@ pub fn materialize_model_chunked_in_place(
 mod tests {
     use super::*;
 
-    fn crc32_predicate(column: &str, chunk: u64) -> FsResult<String> {
+    fn crc32_predicate(column: &str, chunks: u64, chunk: u64) -> FsResult<String> {
         Ok(if chunk == 0 {
-            format!("({column} is null or crc32({column}) % 4 = 0)")
+            format!("({column} is null or crc32({column}) % {chunks} = 0)")
         } else {
-            format!("({column} is not null and crc32({column}) % 4 = {chunk})")
+            format!("({column} is not null and crc32({column}) % {chunks} = {chunk})")
         })
+    }
+
+    fn bucket(chunks: u64, chunk: u64) -> Bucket {
+        Bucket { chunks, chunk }
     }
 
     const CHUNKED_SQL: &str = "with o as (select * from orders where (customer_id is null or crc32(customer_id) % 4 = 0) /* dbt_chunk: customer_id */),
@@ -939,7 +1182,7 @@ select * from o join c using (customer_id) join s using (store_id)";
     #[test]
     fn chunk_filters_are_rewritten_in_place() {
         let rewritten =
-            rewrite_chunk_filters(CHUNKED_SQL, ChunkTarget::Chunk(3), crc32_predicate).unwrap();
+            rewrite_chunk_filters(CHUNKED_SQL, 4, bucket(4, 3), crc32_predicate).unwrap();
         assert_eq!(
             rewritten.matches("(customer_id is not null and crc32(customer_id) % 4 = 3) /* dbt_chunk: customer_id */").count(),
             2
@@ -952,7 +1195,7 @@ select * from o join c using (customer_id) join s using (store_id)";
     #[test]
     fn chunk_zero_is_left_as_compiled() {
         assert_eq!(
-            rewrite_chunk_filters(CHUNKED_SQL, ChunkTarget::Chunk(0), crc32_predicate).unwrap(),
+            rewrite_chunk_filters(CHUNKED_SQL, 4, bucket(4, 0), crc32_predicate).unwrap(),
             CHUNKED_SQL
         );
     }
@@ -960,21 +1203,104 @@ select * from o join c using (customer_id) join s using (store_id)";
     #[test]
     fn hand_written_chunk_filters_are_rejected() {
         let sql = "select * from t where crc32(k) % 8 = 0 /* dbt_chunk: k */";
-        assert!(rewrite_chunk_filters(sql, ChunkTarget::Chunk(1), crc32_predicate).is_err());
-        assert!(rewrite_chunk_filters(sql, ChunkTarget::All, crc32_predicate).is_err());
+        assert!(rewrite_chunk_filters(sql, 8, bucket(8, 1), crc32_predicate).is_err());
+        assert!(rewrite_chunk_filters(sql, 8, bucket(16, 0), crc32_predicate).is_err());
     }
 
     #[test]
-    fn unchunked_sql_has_no_filters_left() {
-        let unchunked =
-            rewrite_chunk_filters(CHUNKED_SQL, ChunkTarget::All, crc32_predicate).unwrap();
+    fn chunk_filters_are_rewritten_for_other_bucketings() {
+        // `sampled`: chunk 0 of 4 is chunks 0 and 4 of 8.
+        let sub = rewrite_chunk_filters(CHUNKED_SQL, 4, bucket(8, 4), crc32_predicate).unwrap();
         assert_eq!(
-            unchunked
-                .matches("(1 = 1) /* dbt_chunk: customer_id */")
+            sub.matches("(customer_id is not null and crc32(customer_id) % 8 = 4) /* dbt_chunk: customer_id */").count(),
+            2
+        );
+        // `full`: chunk 0 of 5 differs from chunk 0 of 4, so it is rewritten too.
+        let first = rewrite_chunk_filters(CHUNKED_SQL, 4, bucket(5, 0), crc32_predicate).unwrap();
+        assert_eq!(
+            first
+                .matches("(customer_id is null or crc32(customer_id) % 5 = 0) /* dbt_chunk: customer_id */")
                 .count(),
             2
         );
-        assert!(!unchunked.contains("crc32"));
+        assert!(!first.contains("% 4"));
+    }
+
+    #[test]
+    fn fingerprints_add_up() {
+        let a = Fingerprint {
+            rows: 2,
+            hash_sum: 10,
+        };
+        let b = Fingerprint {
+            rows: 3,
+            hash_sum: 4_294_967_295,
+        };
+        assert_eq!(
+            a + b,
+            Fingerprint {
+                rows: 5,
+                hash_sum: 4_294_967_305
+            }
+        );
+        assert_eq!(
+            [a, b]
+                .into_iter()
+                .map(Ok)
+                .sum::<FsResult<Fingerprint>>()
+                .unwrap(),
+            a + b
+        );
+        assert_eq!(Fingerprint::default() + a, a);
+    }
+
+    #[test]
+    fn query_integers_are_parsed_strictly() {
+        assert_eq!(parse_integer("42"), Some(42));
+        assert_eq!(parse_integer(" 42.000000 "), Some(42));
+        assert_eq!(
+            parse_integer("92233720368547758070000"),
+            Some(92_233_720_368_547_758_070_000)
+        );
+        assert_eq!(parse_integer("42.5"), None);
+        assert_eq!(parse_integer("none"), None);
+        assert_eq!(parse_integer(""), None);
+    }
+
+    #[test]
+    fn verification_needs_chunks_and_chunk_filters() {
+        let plan = |chunks, verification| SwapPlan {
+            chunks,
+            chunk_output_by: None,
+            verification,
+        };
+        let full = Some(ChunkVerification::Full);
+        assert_eq!(
+            verification_mode(&plan(4, full), CHUNKED_SQL, "model.p.m"),
+            ChunkVerification::Full
+        );
+        assert_eq!(
+            verification_mode(
+                &plan(4, Some(ChunkVerification::Off)),
+                CHUNKED_SQL,
+                "model.p.m"
+            ),
+            ChunkVerification::Off
+        );
+        // Without the flag (the test default), unset means off.
+        assert_eq!(
+            verification_mode(&plan(4, None), CHUNKED_SQL, "model.p.m"),
+            ChunkVerification::Off
+        );
+        // A no-op where there is nothing to verify, so it can be set per folder.
+        assert_eq!(
+            verification_mode(&plan(1, full), CHUNKED_SQL, "model.p.m"),
+            ChunkVerification::Off
+        );
+        assert_eq!(
+            verification_mode(&plan(4, full), "select 1", "model.p.m"),
+            ChunkVerification::Off
+        );
     }
 
     #[test]

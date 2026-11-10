@@ -5,7 +5,7 @@
 use dbt_common::{ErrorCode, FsResult, fs_err};
 
 use crate::schemas::common::{DbtIncrementalStrategy, DbtMaterialization, DbtUniqueKey};
-use crate::schemas::project::FullRefreshStrategy;
+use crate::schemas::project::{ChunkVerification, FullRefreshStrategy};
 use crate::schemas::{DbtModel, InternalDbtNodeAttributes};
 
 /// How a rebuild splits the model into chunks.
@@ -17,6 +17,9 @@ pub struct SwapPlan {
     /// `get_chunk_filter` predicates in its imports. `None` when `chunks > 1`
     /// relies on those predicates alone.
     pub chunk_output_by: Option<String>,
+    /// The model's `chunk_verification`. `None` follows the
+    /// `verify_chunked_rebuilds` flag (resolved where the rebuild runs).
+    pub verification: Option<ChunkVerification>,
 }
 
 /// The validated `swap` configuration of `model`, or `None` when the model does
@@ -101,6 +104,7 @@ fn chunk_plan(model: &DbtModel, feature: &str) -> FsResult<SwapPlan> {
     Ok(SwapPlan {
         chunks,
         chunk_output_by,
+        verification: config.chunk_verification,
     })
 }
 
@@ -142,7 +146,8 @@ mod tests {
             swap_plan(&m).unwrap(),
             Some(SwapPlan {
                 chunks: 8,
-                chunk_output_by: Some("id".to_string())
+                chunk_output_by: Some("id".to_string()),
+                verification: None,
             })
         );
     }
@@ -156,7 +161,8 @@ mod tests {
             swap_plan(&m).unwrap(),
             Some(SwapPlan {
                 chunks: 8,
-                chunk_output_by: Some("id".to_string())
+                chunk_output_by: Some("id".to_string()),
+                verification: None,
             })
         );
     }
@@ -170,9 +176,47 @@ mod tests {
             swap_plan(&m).unwrap(),
             Some(SwapPlan {
                 chunks: 8,
-                chunk_output_by: None
+                chunk_output_by: None,
+                verification: None,
             })
         );
+    }
+
+    #[test]
+    fn chunk_verification_is_carried_into_the_plan() {
+        let mut config = swap(Some(4));
+        config.chunk_verification = Some(ChunkVerification::Full);
+        let m = model(config, DbtMaterialization::Table);
+        assert_eq!(
+            swap_plan(&m).unwrap().unwrap().verification,
+            Some(ChunkVerification::Full)
+        );
+    }
+
+    #[test]
+    fn chunk_verification_accepts_names_booleans_and_jinja_output() {
+        #[derive(serde::Deserialize)]
+        struct Config {
+            #[serde(
+                default,
+                deserialize_with = "crate::schemas::project::configs::model_config::chunk_verification_or_bool"
+            )]
+            chunk_verification: Option<ChunkVerification>,
+        }
+        let parse = |yaml: &str| -> Result<Option<ChunkVerification>, String> {
+            let config: Config = dbt_yaml::from_str(&format!("chunk_verification: {yaml}"))
+                .map_err(|e| e.to_string())?;
+            Ok(config.chunk_verification)
+        };
+        assert_eq!(parse("full"), Ok(Some(ChunkVerification::Full)));
+        assert_eq!(parse("Sampled"), Ok(Some(ChunkVerification::Sampled)));
+        assert_eq!(parse("\" off \""), Ok(Some(ChunkVerification::Off)));
+        assert_eq!(parse("false"), Ok(Some(ChunkVerification::Off)));
+        assert_eq!(parse("true"), Ok(Some(ChunkVerification::Sampled)));
+        assert_eq!(parse("null"), Ok(None));
+        assert!(parse("everything").is_err());
+        let unset: Config = dbt_yaml::from_str("chunks: 4").unwrap();
+        assert_eq!(unset.chunk_verification, None);
     }
 
     #[test]
@@ -193,7 +237,8 @@ mod tests {
             in_place_chunk_plan(&m).unwrap(),
             Some(SwapPlan {
                 chunks: 16,
-                chunk_output_by: None
+                chunk_output_by: None,
+                verification: None,
             })
         );
     }

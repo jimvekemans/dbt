@@ -31,6 +31,17 @@ pub fn chunk_bucket_expr(adapter_type: AdapterType, column: &str, chunks: u64) -
     Some(expr)
 }
 
+/// Range of [`row_hash_expr`]: hashes are in `0..2^32`, so the sum over a
+/// relation fits a `numeric(28, 6)` for up to about 10^12 rows.
+pub const ROW_HASH_RANGE: u64 = 1 << 32;
+
+/// A non-negative integer hash of `expr` in `0..ROW_HASH_RANGE`, for the row
+/// fingerprints that verify chunked rebuilds. The same per-backend hash as the
+/// chunk buckets, or `None` where that has no default.
+pub fn row_hash_expr(adapter_type: AdapterType, expr: &str) -> Option<String> {
+    chunk_bucket_expr(adapter_type, expr, ROW_HASH_RANGE)
+}
+
 /// Boolean SQL selecting the rows of chunk `chunk` (0-based) out of `chunks`.
 /// Rows whose `column` is NULL belong to chunk 0 and are excluded from every
 /// other chunk explicitly: some backends hash NULL to NULL (the row would be
@@ -76,5 +87,18 @@ mod tests {
     #[test]
     fn unsupported_backends_have_no_default() {
         assert!(chunk_predicate(AdapterType::Exasol, "id", 2, 0).is_none());
+        assert!(row_hash_expr(AdapterType::Exasol, "id").is_none());
+    }
+
+    #[test]
+    fn row_hashes_are_non_negative_32_bit() {
+        assert_eq!(
+            row_hash_expr(AdapterType::SingleStore, "r").unwrap(),
+            "crc32(r) % 4294967296"
+        );
+        assert_eq!(
+            row_hash_expr(AdapterType::Snowflake, "r").unwrap(),
+            "abs(mod(hash(r), 4294967296))"
+        );
     }
 }

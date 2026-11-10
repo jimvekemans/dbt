@@ -30,6 +30,8 @@ object:
       type: adapter.rename_relation
     - name: chunk_predicate
       type: adapter.chunk_predicate
+    - name: row_hash
+      type: adapter.row_hash
     - name: swap_relations
       type: adapter.swap_relations
     - name: execute
@@ -320,6 +322,15 @@ object:
         is-optional: false
       - name: chunk
         type: integer
+        is-optional: false
+    return-type: string
+---
+object:
+  id: adapter.row_hash
+  call:
+    arguments:
+      - name: expr
+        type: string
         is-optional: false
     return-type: string
 ---

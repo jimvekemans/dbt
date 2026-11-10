@@ -1014,3 +1014,58 @@ fn test_full_refresh_swap_relations_default_and_override() {
         "expected adapter.swap_relations call with target, shadow, backup: {calls:?}"
     );
 }
+
+#[test]
+fn test_full_refresh_swap_get_rows_fingerprint_default_and_override() {
+    let harness = MacroTestHarness::for_adapter(AdapterType::SingleStore)
+        .load_all_macros()
+        .build()
+        .expect("harness should build");
+
+    harness.mock().on("row_hash", |args| {
+        let expr = args.first().and_then(Value::as_str).unwrap_or("");
+        Ok(Value::from(format!("crc32({expr}) % 4294967296")))
+    });
+
+    let columns = Value::from_serialize(vec![
+        BTreeMap::from([("quoted", "`id`"), ("data_type", "bigint(20)")]),
+        BTreeMap::from([("quoted", "`amount`"), ("data_type", "decimal(10,2)")]),
+    ]);
+    let ctx = BTreeMap::from([("columns".to_string(), columns)]);
+
+    let stored = harness
+        .render(
+            "{{ get_rows_fingerprint('select * from `db`.`orders`', columns) }}",
+            ctx.clone(),
+        )
+        .expect("get_rows_fingerprint should dispatch to default__get_rows_fingerprint");
+    // Whitespace-insensitive: the cast macros pad their output.
+    let squash = |sql: &str| sql.split_whitespace().collect::<String>();
+    assert_eq!(
+        squash(&stored),
+        squash(
+            "select count(*) as row_count, coalesce(sum(((crc32(concat(\
+             coalesce((`id` :> TEXT), '_dbt_null_'), '|', \
+             coalesce((`amount` :> TEXT), '_dbt_null_'))) % 4294967296) :> numeric(28,6))), 0) \
+             as row_hash_sum from (select * from `db`.`orders`) as dbt_fingerprint_source"
+        )
+    );
+
+    let override_harness = MacroTestHarness::for_adapter(AdapterType::SingleStore)
+        .with_root_package("fingerprint_override_project")
+        .load_all_macros()
+        .with_macro(
+            "fingerprint_override_project",
+            "singlestore__get_rows_fingerprint",
+            "{% macro singlestore__get_rows_fingerprint(sql, columns) %}select count(*), 0 from ({{ sql }}) as s{% endmacro %}",
+        )
+        .build()
+        .expect("override harness should build");
+    let rendered_override = override_harness
+        .render("{{ get_rows_fingerprint('select 1', columns) }}", ctx)
+        .expect("get_rows_fingerprint should dispatch to singlestore__get_rows_fingerprint");
+    assert_eq!(
+        rendered_override.trim(),
+        "select count(*), 0 from (select 1) as s"
+    );
+}

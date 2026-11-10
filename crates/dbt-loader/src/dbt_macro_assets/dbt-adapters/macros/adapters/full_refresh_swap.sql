@@ -64,6 +64,40 @@
   {{ return('and ' ~ filter if filter else '') }}
 {%- endmacro %}
 
+{#
+  A query returning one row `(row_count, row_hash_sum)` that describes the rows
+  of `sql` in any order: the number of rows and the sum of a hash of each row.
+  Fingerprints of disjoint row sets add up. Chunked rebuilds compare them to
+  verify their chunk filters (`chunk_verification`).
+
+  `columns` are the target relation's columns (`adapter.get_columns_in_relation`),
+  hashed in that order. Values are hashed as `sql` returns them, so model SQL and
+  the relation it was loaded into hash alike as long as the relation's column
+  types are the ones the SQL produces (they are when the first chunk creates it).
+
+  The default hashes each row the way `dbt_utils.generate_surrogate_key` builds
+  its key: every value cast to a string, NULL replaced by a marker, joined with
+  a separator; then `adapter.row_hash`, a non-negative 32-bit hash.
+#}
+-- funcsign: (string, list[base_column]) -> string
+{% macro get_rows_fingerprint(sql, columns) -%}
+  {{ return(adapter.dispatch('get_rows_fingerprint', 'dbt')(sql, columns)) }}
+{%- endmacro %}
+
+-- funcsign: (string, list[base_column]) -> string
+{% macro default__get_rows_fingerprint(sql, columns) -%}
+  {%- set fields = [] -%}
+  {%- for column in columns -%}
+    {%- do fields.append("coalesce(" ~ cast(column.quoted, type_string()) ~ ", '_dbt_null_')") -%}
+    {%- if not loop.last -%}{%- do fields.append("'|'") -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set row_hash = adapter.row_hash(concat(fields)) -%}
+  {{ return(
+      "select count(*) as row_count, coalesce(sum(" ~ cast("(" ~ row_hash ~ ")", type_numeric())
+      ~ "), 0) as row_hash_sum from (\n" ~ sql ~ "\n) as dbt_fingerprint_source"
+  ) }}
+{%- endmacro %}
+
 -- funcsign: (relation, relation, relation) -> none
 {% macro swap_relations(relation, shadow, backup) -%}
   {{ return(adapter.dispatch('swap_relations', 'dbt')(relation, shadow, backup)) }}
